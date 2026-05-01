@@ -1,203 +1,477 @@
-#![allow(dead_code)]
+use std::{
+    collections::HashMap,
+    mem,
+    os::fd::RawFd,
+    sync::{Mutex, OnceLock},
+};
 
-use crate::dynamic_fn;
+use libc::{AF_UNIX, c_void, sa_family_t, sockaddr, sockaddr_un};
 
-use std::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_void};
-
-pub type Display = c_void;
-pub type Window = c_ulong;
-pub type Atom = c_ulong;
-pub type Time = c_ulong;
-pub type Bool = c_int;
-pub type Status = c_int;
-
-pub(super) const CLIENT_MESSAGE: c_int = 33;
-pub(super) const SUBSTRUCTURE_NOTIFY_MASK: c_long = 1 << 19;
-pub(super) const SUBSTRUCTURE_REDIRECT_MASK: c_long = 1 << 20;
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub(super) union XClientMessageData {
-    pub b: [c_char; 20],
-    pub s: [c_short; 10],
-    pub l: [c_long; 5],
+#[derive(PartialEq)]
+enum State {
+    Setup,
+    Connected,
 }
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub(super) struct XClientMessageEvent {
-    pub type_: c_int,
-    pub serial: c_ulong,
-    pub send_event: Bool,
-    pub display: *mut Display,
-    pub window: Window,
-    pub message_type: Atom,
-    pub format: c_int,
-    pub data: XClientMessageData,
+#[derive(PartialEq, Clone, Copy)]
+enum InjectedType {
+    InternAtom,
+    Other,
 }
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub(super) union XEvent {
-    pub type_: c_int,
-    pub xclient: XClientMessageEvent,
-    pub pad: [c_long; 24],
+struct X11Conn {
+    real_fd: RawFd,
+    tx_state: State,
+    rx_state: State,
+    tx_buf: Vec<u8>,
+    rx_buf: Vec<u8>,
+    is_le: bool,
+    server_seq: u16,
+    seq_offset: u16,
+    injected_seqs: HashMap<u16, InjectedType>,
+    net_wm_moveresize: Option<u32>,
+    root_window: u32,
+    root_x: i16,
+    root_y: i16,
+    button: u8,
 }
 
-pub(super) struct NetWmMoveResizePayload {
-    pub x_root: c_long,
-    pub y_root: c_long,
-    pub direction: c_long,
-    pub button: c_long,
-    pub source_indication: c_long,
-}
-
-pub(super) fn make_net_wm_moveresize_event(
-    display: *mut Display,
-    window: Window,
-    net_wm_moveresize_atom: Atom,
-    payload: NetWmMoveResizePayload,
-) -> XEvent {
-    XEvent {
-        xclient: XClientMessageEvent {
-            type_: CLIENT_MESSAGE,
-            serial: 0,
-            send_event: 1,
-            display,
-            window,
-            message_type: net_wm_moveresize_atom,
-            format: 32,
-            data: XClientMessageData {
-                l: [
-                    payload.x_root,
-                    payload.y_root,
-                    payload.direction,
-                    payload.button,
-                    payload.source_indication,
-                ],
-            },
-        },
+impl X11Conn {
+    fn new(real_fd: RawFd) -> Self {
+        Self {
+            real_fd,
+            tx_state: State::Setup,
+            rx_state: State::Setup,
+            tx_buf: Vec::new(),
+            rx_buf: Vec::new(),
+            is_le: true,
+            server_seq: 0,
+            seq_offset: 0,
+            injected_seqs: HashMap::new(),
+            net_wm_moveresize: None,
+            root_window: 0,
+            root_x: 0,
+            root_y: 0,
+            button: 1, // Default to Left Click
+        }
     }
 }
 
-type XOpenDisplayFn = unsafe extern "C" fn(*const c_char) -> *mut Display;
-type XUngrabPointerFn = unsafe extern "C" fn(*mut Display, Time) -> c_int;
-type XQueryPointerFn = unsafe extern "C" fn(
-    *mut Display,
-    Window,
-    *mut Window,
-    *mut Window,
-    *mut c_int,
-    *mut c_int,
-    *mut c_int,
-    *mut c_int,
-    *mut c_uint,
-) -> Bool;
-type XInternAtomFn = unsafe extern "C" fn(*mut Display, *const c_char, Bool) -> Atom;
-type XSendEventFn = unsafe extern "C" fn(*mut Display, Window, Bool, c_long, *mut XEvent) -> Status;
-type XFlushFn = unsafe extern "C" fn(*mut Display) -> c_int;
-type XDefaultRootWindowFn = unsafe extern "C" fn(*mut Display) -> Window;
-type XCloseDisplayFn = unsafe extern "C" fn(*mut Display) -> c_int;
+static IS_X11: OnceLock<bool> = OnceLock::new();
+static X11_CONNS: OnceLock<Mutex<HashMap<RawFd, X11Conn>>> = OnceLock::new();
 
-dynamic_fn!(pub x_open_display, XOpenDisplayFn, "XOpenDisplay");
-dynamic_fn!(pub x_ungrab_pointer, XUngrabPointerFn, "XUngrabPointer");
-dynamic_fn!(pub x_query_pointer, XQueryPointerFn, "XQueryPointer");
-dynamic_fn!(pub x_intern_atom, XInternAtomFn, "XInternAtom");
-dynamic_fn!(pub x_send_event, XSendEventFn, "XSendEvent");
-dynamic_fn!(pub x_flush, XFlushFn, "XFlush");
-dynamic_fn!(pub x_default_root_window, XDefaultRootWindowFn, "XDefaultRootWindow");
-dynamic_fn!(pub x_close_display, XCloseDisplayFn, "XCloseDisplay");
+/// Tracks the application side FD of the most recent active X11 connection.
+static LAST_ACTIVE_FD: OnceLock<Mutex<Option<RawFd>>> = OnceLock::new();
 
-pub fn send_net_wm_moveresize_move(window: u64) -> Result<(), String> {
-    let Ok(x_open_display) = x_open_display() else {
-        return Err("Failed to resolve XOpenDisplay".into());
+// ── Wire formatting helpers ────────────────────────────────────────────────
+
+#[inline]
+fn r16(b: &[u8], le: bool) -> u16 {
+    if le {
+        u16::from_le_bytes(b[0..2].try_into().unwrap())
+    } else {
+        u16::from_be_bytes(b[0..2].try_into().unwrap())
+    }
+}
+
+#[inline]
+fn r32(b: &[u8], le: bool) -> u32 {
+    if le {
+        u32::from_le_bytes(b[0..4].try_into().unwrap())
+    } else {
+        u32::from_be_bytes(b[0..4].try_into().unwrap())
+    }
+}
+
+#[inline]
+fn write_u16(b: &mut [u8], v: u16, le: bool) {
+    b[0..2].copy_from_slice(&(if le { v.to_le_bytes() } else { v.to_be_bytes() }));
+}
+
+#[inline]
+fn write_u32(b: &mut [u8], v: u32, le: bool) {
+    b[0..4].copy_from_slice(&(if le { v.to_le_bytes() } else { v.to_be_bytes() }));
+}
+
+fn update_last_active_fd(fd: RawFd) {
+    if let Some(m) = LAST_ACTIVE_FD.get()
+        && let Ok(mut opt) = m.lock()
+    {
+        *opt = Some(fd);
+    }
+}
+
+// ── Stream parsers & Rewriters ─────────────────────────────────────────────
+
+pub(crate) fn feed_inbound(fd: RawFd, chunk: &[u8]) -> Vec<u8> {
+    update_last_active_fd(fd);
+    let Some(m) = X11_CONNS.get() else {
+        return chunk.to_vec();
     };
-    let Ok(x_ungrab_pointer) = x_ungrab_pointer() else {
-        return Err("Failed to resolve XUngrabPointer".into());
+    let Ok(mut map) = m.lock() else {
+        return chunk.to_vec();
     };
-    let Ok(x_query_pointer) = x_query_pointer() else {
-        return Err("Failed to resolve XQueryPointer".into());
-    };
-    let Ok(x_intern_atom) = x_intern_atom() else {
-        return Err("Failed to resolve XInternAtom".into());
-    };
-    let Ok(x_send_event) = x_send_event() else {
-        return Err("Failed to resolve XSendEvent".into());
-    };
-    let Ok(x_flush) = x_flush() else {
-        return Err("Failed to resolve XFlush".into());
-    };
-    let Ok(x_default_root_window) = x_default_root_window() else {
-        return Err("Failed to resolve XDefaultRootWindow".into());
-    };
-    let Ok(x_close_display) = x_close_display() else {
-        return Err("Failed to resolve XCloseDisplay".into());
+    let Some(conn) = map.get_mut(&fd) else {
+        return chunk.to_vec();
     };
 
-    let display = unsafe { x_open_display(std::ptr::null()) };
-    if display.is_null() {
-        return Err("Failed to open X display".into());
+    let mut out = Vec::new();
+    conn.rx_buf.extend_from_slice(chunk);
+
+    let mut off = 0;
+    while off < conn.rx_buf.len() {
+        if conn.rx_state == State::Setup {
+            if conn.rx_buf.len() - off < 8 {
+                break;
+            }
+            let status = conn.rx_buf[off];
+
+            let total = if status == 1 || status == 2 {
+                // Success or Authenticate
+                8 + (r16(&conn.rx_buf[off + 6..off + 8], conn.is_le) as usize) * 4
+            } else {
+                // Failed
+                8 + ((conn.rx_buf[off + 1] as usize + 3) & !3)
+            };
+
+            if conn.rx_buf.len() - off < total {
+                break;
+            }
+
+            if status == 1 && conn.root_window == 0 && conn.rx_buf.len() - off >= 32 {
+                let vendor_len = r16(&conn.rx_buf[off + 24..off + 26], conn.is_le) as usize;
+                let num_formats = conn.rx_buf[off + 29] as usize;
+                let pad_vendor = (vendor_len + 3) & !3;
+                let screen_off = off + 40 + pad_vendor + num_formats * 8;
+                if screen_off + 4 <= off + total {
+                    conn.root_window = r32(&conn.rx_buf[screen_off..screen_off + 4], conn.is_le);
+                }
+            }
+
+            conn.rx_state = State::Connected;
+            out.extend_from_slice(&conn.rx_buf[off..off + total]);
+
+            if status == 1 {
+                // Silently inject InternAtom request (28 bytes padded)
+                let mut req = [0u8; 28];
+                req[0] = 16;
+                req[1] = 0;
+                write_u16(&mut req[2..4], 7, conn.is_le);
+                write_u16(&mut req[4..6], 18, conn.is_le);
+                req[8..26].copy_from_slice(b"_NET_WM_MOVERESIZE");
+
+                conn.server_seq = conn.server_seq.wrapping_add(1);
+                conn.seq_offset = conn.seq_offset.wrapping_add(1);
+                conn.injected_seqs
+                    .insert(conn.server_seq, InjectedType::InternAtom);
+
+                super::hook::send_raw_msg(conn.real_fd, &req);
+            }
+
+            off += total;
+        } else {
+            if conn.rx_buf.len() - off < 32 {
+                break;
+            }
+            let code = conn.rx_buf[off];
+            let is_reply_or_error = code == 0 || code == 1;
+            let _is_event = code >= 2;
+
+            let total = match code & 0x7F {
+                1 | 35 => 32 + (r32(&conn.rx_buf[off + 4..off + 8], conn.is_le) as usize) * 4,
+                _ => 32,
+            };
+            if conn.rx_buf.len() - off < total {
+                break;
+            }
+
+            let mut msg = conn.rx_buf[off..off + total].to_vec();
+            let seq = r16(&msg[2..4], conn.is_le);
+            let mut drop = false;
+
+            if is_reply_or_error && let Some(inj_type) = conn.injected_seqs.remove(&seq) {
+                drop = true;
+                if code == 1 && inj_type == InjectedType::InternAtom {
+                    conn.net_wm_moveresize = Some(r32(&msg[8..12], conn.is_le));
+                }
+            }
+
+            if !drop {
+                let evt_code = code & 0x7F;
+
+                // KeymapNotify (11) is the only event without a sequence number
+                if conn.seq_offset > 0 && evt_code != 11 {
+                    let new_seq = seq.wrapping_sub(conn.seq_offset);
+                    write_u16(&mut msg[2..4], new_seq, conn.is_le);
+                }
+
+                // Track absolute coordinates
+                if evt_code == 4 || evt_code == 5 || evt_code == 6 {
+                    // Legacy Core X11 Pointer Events
+                    conn.root_window = r32(&msg[8..12], conn.is_le);
+                    if evt_code == 4 {
+                        // ButtonPress
+                        conn.button = msg[1];
+                        conn.root_x = r16(&msg[20..22], conn.is_le) as i16;
+                        conn.root_y = r16(&msg[22..24], conn.is_le) as i16;
+                    }
+                } else if evt_code == 35 {
+                    // XInput2 GenericEvents (Modern Qt/GTK)
+                    if msg.len() >= 40 {
+                        let evtype = r16(&msg[8..10], conn.is_le);
+                        if evtype == 4 || evtype == 5 || evtype == 6 {
+                            // XI_ButtonPress/Release/Motion
+                            conn.root_window = r32(&msg[20..24], conn.is_le);
+                            if evtype == 4 {
+                                // XI_ButtonPress
+                                conn.button = r32(&msg[16..20], conn.is_le) as u8;
+
+                                // XInput2 uses 32-bit fixed point (16.16) coordinates. We shift right by 16
+                                // to convert them back to standard integers (retaining the sign bit).
+                                let rx_fp = r32(&msg[32..36], conn.is_le) as i32;
+                                let ry_fp = r32(&msg[36..40], conn.is_le) as i32;
+                                conn.root_x = (rx_fp >> 16) as i16;
+                                conn.root_y = (ry_fp >> 16) as i16;
+                            }
+                        }
+                    }
+                }
+
+                out.extend_from_slice(&msg);
+            }
+
+            off += total;
+        }
+    }
+    conn.rx_buf.drain(..off);
+    if conn.rx_buf.len() > 4 * 1024 * 1024 {
+        conn.rx_buf.clear();
+    }
+    out
+}
+
+pub(crate) fn feed_outbound(fd: RawFd, chunk: &[u8]) -> Vec<u8> {
+    update_last_active_fd(fd);
+    let Some(m) = X11_CONNS.get() else {
+        return chunk.to_vec();
+    };
+    let Ok(mut map) = m.lock() else {
+        return chunk.to_vec();
+    };
+    let Some(conn) = map.get_mut(&fd) else {
+        return chunk.to_vec();
+    };
+
+    let mut out = Vec::new();
+    conn.tx_buf.extend_from_slice(chunk);
+
+    let mut off = 0;
+    while off < conn.tx_buf.len() {
+        if conn.tx_state == State::Setup {
+            if conn.tx_buf.len() - off < 12 {
+                break;
+            }
+            let is_le = conn.tx_buf[off] == b'l';
+            let nlen = r16(&conn.tx_buf[off + 6..off + 8], is_le);
+            let dlen = r16(&conn.tx_buf[off + 8..off + 10], is_le);
+            let total = 12 + ((nlen + 3) & !3) as usize + ((dlen + 3) & !3) as usize;
+            if conn.tx_buf.len() - off < total {
+                break;
+            }
+
+            conn.is_le = is_le;
+            conn.tx_state = State::Connected;
+            out.extend_from_slice(&conn.tx_buf[off..off + total]);
+            off += total;
+        } else {
+            if conn.tx_buf.len() - off < 4 {
+                break;
+            }
+            let mut words = r16(&conn.tx_buf[off + 2..off + 4], conn.is_le) as usize;
+            let mut hdr = 4;
+            if words == 0 {
+                if conn.tx_buf.len() - off < 8 {
+                    break;
+                }
+                words = r32(&conn.tx_buf[off + 4..off + 8], conn.is_le) as usize;
+                hdr = 8;
+            }
+            let total = words * 4;
+            if total < hdr || conn.tx_buf.len() - off < total {
+                break;
+            }
+
+            conn.server_seq = conn.server_seq.wrapping_add(1);
+            out.extend_from_slice(&conn.tx_buf[off..off + total]);
+            off += total;
+        }
     }
 
-    let mut root_return: Window = 0;
-    let mut child_return: Window = 0;
-    let mut root_x: c_int = 0;
-    let mut root_y: c_int = 0;
-    let mut win_x: c_int = 0;
-    let mut win_y: c_int = 0;
-    let mut mask_return: c_uint = 0;
+    conn.tx_buf.drain(..off);
+    if conn.tx_buf.len() > 4 * 1024 * 1024 {
+        conn.tx_buf.clear();
+    }
+    out
+}
 
-    let query_ok = unsafe {
-        x_query_pointer(
-            display,
-            window,
-            &mut root_return,
-            &mut child_return,
-            &mut root_x,
-            &mut root_y,
-            &mut win_x,
-            &mut win_y,
-            &mut mask_return,
+// ── Public APIs ────────────────────────────────────────────────────────────
+
+pub(crate) fn is_x11_socket(addr: *const c_void, addrlen: u32) -> bool {
+    if addr.is_null() || (addrlen as usize) < mem::size_of::<sa_family_t>() {
+        return false;
+    }
+    let sa = unsafe { &*(addr as *const sockaddr) };
+    if sa.sa_family as i32 != AF_UNIX {
+        return false;
+    }
+
+    let sun = unsafe { &*(addr as *const sockaddr_un) };
+    let path_offset = mem::size_of::<sa_family_t>();
+    let path_len = (addrlen as usize)
+        .saturating_sub(path_offset)
+        .min(sun.sun_path.len());
+    if path_len == 0 {
+        return false;
+    }
+
+    let raw = unsafe { std::slice::from_raw_parts(sun.sun_path.as_ptr() as *const u8, path_len) };
+    let candidate = if raw[0] == 0 {
+        &raw[1..]
+    } else {
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        &raw[..end]
+    };
+
+    candidate.windows(11).any(|w| w == b".X11-unix/X")
+}
+
+pub(crate) fn on_new_connection(fd: RawFd, real_fd: RawFd) {
+    update_last_active_fd(fd);
+    IS_X11.set(true).ok();
+    if let Some(m) = X11_CONNS.get()
+        && let Ok(mut map) = m.lock()
+    {
+        map.insert(fd, X11Conn::new(real_fd));
+    }
+}
+
+pub(crate) fn on_close(fd: RawFd) {
+    if let Some(m) = X11_CONNS.get()
+        && let Ok(mut map) = m.lock()
+    {
+        map.remove(&fd);
+    }
+    if let Some(m) = LAST_ACTIVE_FD.get()
+        && let Ok(mut opt) = m.lock()
+        && opt.is_some_and(|f| f == fd)
+    {
+        *opt = None;
+    }
+}
+
+pub(super) fn is_x11() -> bool {
+    *IS_X11.get().unwrap_or(&false)
+}
+
+/// Sends an interactive move command strictly using the captured connection.
+/// Actively injects `UngrabPointer` first, followed by `SendEvent(ClientMessage)`.
+pub(super) fn send_net_wm_moveresize_move(window: u32) -> bool {
+    let fd = {
+        let Some(m) = LAST_ACTIVE_FD.get() else {
+            return false;
+        };
+        let Ok(opt) = m.lock() else {
+            return false;
+        };
+        let Some(fd) = *opt else {
+            return false;
+        };
+        fd
+    };
+
+    let (real_fd, root, atom, root_x, root_y, button, is_le) = {
+        let Some(m) = X11_CONNS.get() else {
+            return false;
+        };
+        let Ok(mut map) = m.lock() else {
+            return false;
+        };
+        let Some(conn) = map.get_mut(&fd) else {
+            return false;
+        };
+
+        let Some(atom) = conn.net_wm_moveresize else {
+            eprintln!("[x11] Failed to retrieve _NET_WM_MOVERESIZE Atom during setup");
+            return false;
+        };
+        if conn.root_window == 0 {
+            eprintln!("[x11] Failed to capture default Root Window ID");
+            return false;
+        }
+
+        conn.server_seq = conn.server_seq.wrapping_add(2);
+        conn.seq_offset = conn.seq_offset.wrapping_add(2);
+        conn.injected_seqs
+            .insert(conn.server_seq.wrapping_sub(1), InjectedType::Other);
+        conn.injected_seqs
+            .insert(conn.server_seq, InjectedType::Other);
+
+        (
+            conn.real_fd,
+            conn.root_window,
+            atom,
+            conn.root_x,
+            conn.root_y,
+            conn.button,
+            conn.is_le,
         )
     };
-    if query_ok == 0 {
-        return Err("Failed to query pointer on X display".into());
+
+    let mut payload = [0u8; 52];
+
+    // --- 1. UngrabPointer ---
+    payload[0] = 27; // Opcode
+    write_u16(&mut payload[2..4], 2, is_le); // Length (2 words)
+    write_u32(&mut payload[4..8], 0, is_le); // CurrentTime (0)
+
+    // --- 2. SendEvent (ClientMessage) ---
+    payload[8] = 25; // Opcode
+    payload[9] = 0; // Propagate: False
+    write_u16(&mut payload[10..12], 11, is_le); // Length (11 words = 44 Bytes)
+    write_u32(&mut payload[12..16], root, is_le); // Target Window
+    write_u32(&mut payload[16..20], 0x180000, is_le); // SubstructureRedirectMask | SubstructureNotifyMask
+
+    // Event Payload (32 Bytes for ClientMessage)
+    payload[20] = 33; // Event Code
+    payload[21] = 32; // Format: 32-bit values
+    write_u16(&mut payload[22..24], 0, is_le); // Sequence (Ignored by server)
+    write_u32(&mut payload[24..28], window, is_le); // Message Window
+    write_u32(&mut payload[28..32], atom, is_le); // Message Type (Atom)
+
+    // Data Values
+    write_u32(&mut payload[32..36], root_x as u32, is_le);
+    write_u32(&mut payload[36..40], root_y as u32, is_le);
+    write_u32(&mut payload[40..44], 8, is_le); // Direction: _NET_WM_MOVERESIZE_MOVE = 8
+    write_u32(&mut payload[44..48], button as u32, is_le); // Captured Pointer Button
+    write_u32(&mut payload[48..52], 1, is_le); // Source indication: Normal Client = 1
+
+    super::hook::send_raw_msg(real_fd, &payload)
+}
+
+pub(crate) fn init_state() {
+    X11_CONNS.get_or_init(|| Mutex::new(HashMap::new()));
+    LAST_ACTIVE_FD.get_or_init(|| Mutex::new(None));
+}
+
+pub(crate) fn clear_state() {
+    if let Some(m) = X11_CONNS.get()
+        && let Ok(mut map) = m.lock()
+    {
+        map.clear();
     }
-
-    let net_wm_moveresize_atom =
-        unsafe { x_intern_atom(display, c"_NET_WM_MOVERESIZE".as_ptr(), 0) };
-    if net_wm_moveresize_atom == 0 {
-        return Err("Failed to intern _NET_WM_MOVERESIZE atom on X display".into());
+    if let Some(m) = LAST_ACTIVE_FD.get()
+        && let Ok(mut opt) = m.lock()
+    {
+        *opt = None;
     }
-
-    let payload = NetWmMoveResizePayload {
-        x_root: root_x as c_long,
-        y_root: root_y as c_long,
-        direction: 8,         // _NET_WM_MOVERESIZE_MOVE
-        button: 1,            // left mouse button
-        source_indication: 1, // _NET_WM_MOVERESIZE_SOURCE_INDICATION
-    };
-    let mut event = make_net_wm_moveresize_event(display, window, net_wm_moveresize_atom, payload);
-
-    unsafe { x_ungrab_pointer(display, 0) };
-    unsafe { x_flush(display) };
-
-    let root = unsafe { x_default_root_window(display) };
-    let send_ok = unsafe {
-        x_send_event(
-            display,
-            root,
-            0,
-            SUBSTRUCTURE_NOTIFY_MASK | SUBSTRUCTURE_REDIRECT_MASK,
-            &mut event,
-        )
-    };
-    if send_ok == 0 {
-        return Err("Failed to send _NET_WM_MOVERESIZE client message to X display".into());
-    }
-
-    unsafe { x_flush(display) };
-    unsafe { x_close_display(display) };
-
-    Ok(())
 }
