@@ -5,7 +5,12 @@ import {
 } from "../audioplayer";
 import { registerCallHandler } from "../calls";
 import { fireNativeCall } from "../channel";
-import { dispatchChatRoomMsg, imState } from "../yunxin";
+import {
+  dispatchChatRoomMsg,
+  imState,
+  performLoginIM,
+  sendChatroomText,
+} from "../yunxin";
 import {
   extractListenTogetherCommandInfo,
   getCommandSongId,
@@ -22,7 +27,8 @@ type ImEnterParams = {
 };
 
 type ImSendParams = {
-  text: string;
+  msg?: unknown;
+  text?: string;
   to: string;
 };
 
@@ -105,7 +111,10 @@ registerCallHandler<[ImEnterParams], [Record<string, unknown>]>(
         setTimeout(() => fireNativeCall(event, result), (i + 1) * 30);
       });
 
-    ipcRenderer.send(IPC.NIM_JOIN_CHATROOM, chatRoomId, localState.userId);
+    performLoginIM(chatRoomId, localState.userId).catch((e) => {
+      console.warn("[im] performLoginIM failed:", e);
+    });
+
     return [result];
   }
 );
@@ -120,23 +129,15 @@ registerCallHandler<[], [boolean]>("im.leave", () => {
   return [true];
 });
 
-registerCallHandler<[ImSendParams], [boolean]>("im.sendText", async (params) => {
-  try {
-    const result = await ipcRenderer.invoke(IPC.NIM_SEND_CHATROOM_MSG, { text: params.text, to: params.to });
-    return [result?.code === 200];
-  } catch (e) {
-    console.warn("[im] sendText IPC failed:", e);
-    return [true];
-  }
+registerCallHandler<[ImSendParams], [boolean]>("im.sendText", (params) => {
+  const ok = sendChatroomText(params.text ?? "");
+  return [ok];
 });
-registerCallHandler<[ImSendParams], [boolean]>("im.sendMsg", async (params) => {
-  try {
-    const result = await ipcRenderer.invoke(IPC.NIM_SEND_CHATROOM_MSG, { msg: params, to: params.to });
-    return [result?.code === 200];
-  } catch (e) {
-    console.warn("[im] sendMsg IPC failed:", e);
-    return [true];
-  }
+
+registerCallHandler<[ImSendParams], [boolean]>("im.sendMsg", (params) => {
+  const text = typeof params.msg === "string" ? params.msg : JSON.stringify(params.msg ?? {});
+  const ok = sendChatroomText(text);
+  return [ok];
 });
 
 registerCallHandler<[], [{ members: never[]; code: number }]>(
