@@ -27,9 +27,17 @@ fn disable_display_server_hooks() -> bool {
     })
 }
 
+// Both false -> we are not connecting to either display server,
+// so dragWindow will just fail gracefully
+
 #[neon::export]
 fn is_wayland() -> bool {
     wayland::is_wayland()
+}
+
+#[neon::export]
+fn is_x11() -> bool {
+    x11::is_x11()
 }
 
 #[neon::export]
