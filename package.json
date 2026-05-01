@@ -65,17 +65,14 @@
     "unzipper": "^0.12.3",
     "vite": "^7.3.2"
   },
-    "dependencies": {
+  "dependencies": {
     "7z-wasm": "^1.2.0",
     "@open-orpheus/database": "workspace:*",
     "@open-orpheus/ui": "workspace:*",
     "@open-orpheus/window": "workspace:*",
     "@silvia-odwyer/photon-node": "^0.3.4",
-    "bufferutil": "^4.1.0",
     "electron-squirrel-startup": "^1.0.1",
-    "music-tag-native": "^0.2.4",
-    "utf-8-validate": "^6.0.6",
-    "ws": "^8.20.0"
+    "music-tag-native": "^0.2.4"
   },
   "optionalDependencies": {
     "@malept/electron-installer-flatpak": "^0.11.4",
