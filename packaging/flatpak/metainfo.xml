@@ -59,6 +59,12 @@
   </screenshots>
 
   <releases>
+    <release version="0.8.0" date="2026-05-01">
+      <description>
+        <p>Allow custom download/cache paths; fix X11 window dragging; fix Shell API Windows path handling; enforce initial download directory selection in Flatpak.</p>
+        <p xml:lang="zh-CN">允许自定义下载/缓存路径；修复 X11 窗口拖动问题；修复 Shell API 的 Windows 路径处理问题；强制在 Flatpak 中选择初始下载目录。</p>
+      </description>
+    </release>
     <release version="0.7.0" date="2026-04-29">
       <description>
         <p>Supports local music library, local music playback and music downloading.</p>
