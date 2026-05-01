@@ -1,11 +1,13 @@
 // Wayland man-in-the-middle hooker
 //
 // Strategy:
-//   • Inline-hook connect(2), close(2), recvmsg(2), sendmsg(2) in libc using
-//     `sighook::inline_hook_jump`. sighook patches each libc entry with either
-//     a near or absolute jump, so the hook stays valid regardless of ASLR
-//     layout. Original libc calls are preserved via raw symbol pointers and are
-//     invoked by temporarily unhooking the patched entry under a small mutex.
+//   • Inline-hook connect(2) and close(2) in libc using `sighook::inline_hook_jump`.
+//   • When connect(2) detects a Wayland socket, we create a proxy `socketpair`,
+//     connect a separate real socket to the Wayland server, and swap the app's
+//     fd using `dup2`. A background thread proxies traffic and FDs between the
+//     app and the real server, parsing the Wayland wire format in transit.
+//   • This avoids the need to hook recvmsg/sendmsg, simplifying FD and state
+//     management.
 //
 // Wire format (from connection.c):
 //   [object_id : u32][size<<16 | opcode : u32][payload ...]
@@ -25,8 +27,8 @@ use std::{
 };
 
 use libc::{
-    AF_UNIX, RTLD_DEFAULT, SYS_close, SYS_connect, SYS_recvmsg, SYS_sendmsg, c_int, c_long, c_void,
-    dlsym, msghdr, sa_family_t, sockaddr, sockaddr_un, ssize_t, syscall,
+    AF_UNIX, RTLD_DEFAULT, SYS_close, SYS_connect, c_int, c_long, c_void, dlsym, msghdr,
+    sa_family_t, sockaddr, sockaddr_un, syscall,
 };
 use sighook::{inline_hook_jump, unhook};
 
@@ -34,8 +36,6 @@ use sighook::{inline_hook_jump, unhook};
 
 static HOOK_CONNECT_ADDR: OnceLock<u64> = OnceLock::new();
 static HOOK_CLOSE_ADDR: OnceLock<u64> = OnceLock::new();
-static HOOK_RECVMSG_ADDR: OnceLock<u64> = OnceLock::new();
-static HOOK_SENDMSG_ADDR: OnceLock<u64> = OnceLock::new();
 
 // ── Per-connection tracking state ──────────────────────────────────────────
 
@@ -802,20 +802,151 @@ fn call_close(fd: c_int) -> c_int {
     raw_syscall_ret(SYS_close as c_long, &[fd as usize]) as c_int
 }
 
-#[inline]
-fn call_recvmsg(fd: c_int, hdr: *mut msghdr, flags: c_int) -> ssize_t {
-    raw_syscall_ret(
-        SYS_recvmsg as c_long,
-        &[fd as usize, hdr as usize, flags as usize],
-    ) as ssize_t
+// ── Proxy MITM Helpers ────────────────────────────────────────────────────
+
+fn forward_msg(from: RawFd, to: RawFd, is_event: bool, app_fd: RawFd) -> bool {
+    let mut buf = vec![0u8; 65536];
+    let mut cmsg_buf = vec![0u8; 1024];
+
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut c_void,
+        iov_len: buf.len(),
+    };
+
+    let mut msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: cmsg_buf.as_mut_ptr() as *mut c_void,
+        msg_controllen: cmsg_buf.len(),
+        msg_flags: 0,
+    };
+
+    let n = loop {
+        let ret = unsafe { libc::recvmsg(from, &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if ret < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+            continue;
+        }
+        break ret;
+    };
+
+    if n <= 0 {
+        return false;
+    }
+
+    let data = &buf[..n as usize];
+    if is_event {
+        feed_inbound(app_fd, data);
+    } else {
+        feed_outbound(app_fd, data);
+    }
+
+    let cmsg_ptr = msg.msg_control;
+    let cmsg_len = msg.msg_controllen;
+
+    //iov.iov_len = n as usize;
+    let mut total_sent = 0;
+
+    while total_sent < n as usize {
+        //iov.iov_base = unsafe { buf.as_mut_ptr().add(total_sent) } as *mut c_void;
+        //iov.iov_len = (n as usize) - total_sent;
+
+        if total_sent > 0 {
+            msg.msg_control = std::ptr::null_mut();
+            msg.msg_controllen = 0;
+        }
+
+        let sent = loop {
+            let ret = unsafe { libc::sendmsg(to, &msg, libc::MSG_NOSIGNAL) };
+            if ret < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+                continue;
+            }
+            break ret;
+        };
+
+        if sent <= 0 {
+            break;
+        }
+        total_sent += sent as usize;
+    }
+
+    // Close any FDs we received from the local socket once they've been
+    // queued for sending. Otherwise we leak FDs in the proxy thread.
+    if cmsg_len > 0 && !cmsg_ptr.is_null() {
+        let msg_for_close = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: std::ptr::null_mut(),
+            msg_iovlen: 0,
+            msg_control: cmsg_ptr,
+            msg_controllen: cmsg_len,
+            msg_flags: 0,
+        };
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg_for_close);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let fd_ptr = libc::CMSG_DATA(cmsg) as *mut c_int;
+                    let header_len = (fd_ptr as usize) - (cmsg as usize);
+                    if (*cmsg).cmsg_len as usize > header_len {
+                        let data_len = (*cmsg).cmsg_len as usize - header_len;
+                        let fd_count = data_len / std::mem::size_of::<c_int>();
+                        for i in 0..fd_count {
+                            let fd = *fd_ptr.add(i);
+                            if fd >= 0 {
+                                call_close(fd);
+                            }
+                        }
+                    }
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg_for_close, cmsg);
+            }
+        }
+    }
+
+    total_sent == n as usize
 }
 
-#[inline]
-fn call_sendmsg(fd: c_int, hdr: *const msghdr, flags: c_int) -> ssize_t {
-    raw_syscall_ret(
-        SYS_sendmsg as c_long,
-        &[fd as usize, hdr as usize, flags as usize],
-    ) as ssize_t
+fn proxy_loop(app_fd: RawFd, proxy_fd: RawFd, real_fd: RawFd) {
+    let mut fds = [
+        libc::pollfd {
+            fd: proxy_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: real_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+
+    loop {
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if ret < 0 {
+            let err = unsafe { *libc::__errno_location() };
+            if err == libc::EINTR {
+                continue;
+            }
+            break;
+        }
+
+        if fds[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0
+            && !forward_msg(proxy_fd, real_fd, false, app_fd)
+        {
+            break;
+        }
+
+        if fds[1].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0
+            && !forward_msg(real_fd, proxy_fd, true, app_fd)
+        {
+            break;
+        }
+    }
+
+    call_close(proxy_fd);
+    call_close(real_fd);
 }
 
 // ── Hook callbacks ─────────────────────────────────────────────────────────
@@ -824,18 +955,80 @@ fn call_sendmsg(fd: c_int, hdr: *const msghdr, flags: c_int) -> ssize_t {
 // Calling the original goes straight to the kernel syscall entry so we do not
 // mutate hook state while already inside a hooked libc wrapper.
 
-/// connect(2) — detect Wayland socket fds and register new connections.
+/// connect(2) — detect Wayland socket fds, set up socketpair, proxy real connect.
 extern "C" fn hook_connect(fd: c_int, addr: *const c_void, addrlen: u32) -> c_int {
-    let ret = call_connect(fd, addr, addrlen);
-    if ret == 0 && is_wayland_socket(addr, addrlen) {
-        IS_WAYLAND.set(true).ok();
-        if let Some(m) = CONNS.get()
-            && let Ok(mut map) = m.lock()
-        {
-            map.entry(fd).or_insert_with(WaylandConn::new);
-        }
+    if !is_wayland_socket(addr, addrlen) {
+        return call_connect(fd, addr, addrlen);
     }
-    ret
+
+    // 1. Open a real connection to the Wayland server.
+    let real_fd = unsafe { libc::socket(AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if real_fd < 0 {
+        return -1;
+    }
+
+    let ret = call_connect(real_fd, addr, addrlen);
+    if ret < 0 {
+        let err = unsafe { *libc::__errno_location() };
+        call_close(real_fd);
+        unsafe { *libc::__errno_location() = err };
+        return ret;
+    }
+
+    // 2. Set up our MITM socketpair.
+    let mut pair = [0; 2];
+    if unsafe {
+        libc::socketpair(
+            AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            pair.as_mut_ptr(),
+        )
+    } < 0
+    {
+        let err = unsafe { *libc::__errno_location() };
+        call_close(real_fd);
+        unsafe { *libc::__errno_location() = err };
+        return -1;
+    }
+
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD, 0) };
+    let fl_flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+
+    // 3. Transparently replace the application's file descriptor with our local socket end.
+    if unsafe { libc::dup2(pair[0], fd) } < 0 {
+        let err = unsafe { *libc::__errno_location() };
+        call_close(real_fd);
+        call_close(pair[0]);
+        call_close(pair[1]);
+        unsafe { *libc::__errno_location() = err };
+        return -1;
+    }
+    call_close(pair[0]);
+
+    // Restore any flags (e.g. O_NONBLOCK, FD_CLOEXEC) that the application
+    // might have set on its original socket before calling connect.
+    if fd_flags >= 0 {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags) };
+    }
+    if fl_flags >= 0 {
+        unsafe { libc::fcntl(fd, libc::F_SETFL, fl_flags) };
+    }
+
+    IS_WAYLAND.set(true).ok();
+    if let Some(m) = CONNS.get()
+        && let Ok(mut map) = m.lock()
+    {
+        map.entry(fd).or_insert_with(WaylandConn::new);
+    }
+
+    // 4. Start background proxying loop.
+    let proxy_fd = pair[1];
+    std::thread::spawn(move || {
+        proxy_loop(fd, proxy_fd, real_fd);
+    });
+
+    0
 }
 
 /// close(2) — detect when a tracked Wayland fd is closed.
@@ -846,92 +1039,24 @@ extern "C" fn hook_close(fd: c_int) -> c_int {
     call_close(fd)
 }
 
-/// recvmsg(2) — intercept server→client Wayland events.
-extern "C" fn hook_recvmsg(fd: c_int, hdr: *mut msghdr, flags: c_int) -> ssize_t {
-    let ret = call_recvmsg(fd, hdr, flags);
-    if ret > 0 && is_wayland_fd(fd) && !hdr.is_null() {
-        let h = unsafe { &*hdr };
-        if !h.msg_iov.is_null() {
-            let mut remaining = ret as usize;
-            let mut packet = Vec::with_capacity(remaining);
-            for i in 0..h.msg_iovlen {
-                if remaining == 0 {
-                    break;
-                }
-                let iov = unsafe { &*h.msg_iov.add(i) };
-                if iov.iov_base.is_null() || iov.iov_len == 0 {
-                    continue;
-                }
-                let take = iov.iov_len.min(remaining);
-                packet.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(iov.iov_base as *const u8, take)
-                });
-                remaining -= take;
-            }
-            feed_inbound(fd, &packet);
-        }
-    }
-    ret
-}
-
-/// sendmsg(2) — intercept client→server Wayland requests.
-/// We parse AFTER the actual send so that failed sends do not leave
-/// phantom state, and only the bytes actually accepted by the kernel
-/// are fed to the outbound parser.
-extern "C" fn hook_sendmsg(fd: c_int, hdr: *const msghdr, flags: c_int) -> ssize_t {
-    let ret = call_sendmsg(fd, hdr, flags);
-    if ret > 0 && is_wayland_fd(fd) && !hdr.is_null() {
-        let h = unsafe { &*hdr };
-        if !h.msg_iov.is_null() {
-            let mut remaining = ret as usize;
-            let mut packet = Vec::with_capacity(remaining);
-            for i in 0..h.msg_iovlen {
-                if remaining == 0 {
-                    break;
-                }
-                let iov = unsafe { &*h.msg_iov.add(i) };
-                if iov.iov_base.is_null() || iov.iov_len == 0 {
-                    continue;
-                }
-                let take = iov.iov_len.min(remaining);
-                packet.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(iov.iov_base as *const u8, take)
-                });
-                remaining -= take;
-            }
-            if !packet.is_empty() {
-                feed_outbound(fd, &packet);
-            }
-        }
-    }
-    ret
-}
-
 // ── Public API ─────────────────────────────────────────────────────────────
 
 pub(super) fn is_wayland() -> bool {
     *IS_WAYLAND.get().unwrap_or(&false)
 }
 
-/// Sends raw bytes on the given fd using the original sendmsg(2) trampoline,
-/// bypassing our hook.  Returns `true` if all bytes were sent.
+/// Sends raw bytes on the given fd. Since we use a socketpair proxy,
+/// this simply injects data onto the app side of the socketpair which
+/// naturally proxies it to the real Wayland server.
 ///
-/// This is the low-level building block for sending Wayland requests from
-/// outside the wire-protocol parser (e.g. `send_xdg_toplevel_move`, future
-/// `make_next_created_wayland_window_*()` implementations).
-///
-/// NOTE: a residual interleaving risk exists if libwayland has partially
-/// flushed its internal buffer (sendmsg returned a short write / EAGAIN).
-/// This is extremely unlikely in practice: both this call and libwayland's
-/// flush run on the main thread, the Wayland socket buffer is rarely full,
-/// and small messages are well below PIPE_BUF (atomic kernel write).
+/// Returns `true` if all bytes were sent.
 #[allow(dead_code)]
 pub(super) fn send_raw_wayland(fd: RawFd, data: &mut [u8]) -> bool {
     let mut iov = libc::iovec {
         iov_base: data.as_mut_ptr() as *mut c_void,
         iov_len: data.len(),
     };
-    let msg = libc::msghdr {
+    let msg = msghdr {
         msg_name: std::ptr::null_mut(),
         msg_namelen: 0,
         msg_iov: &mut iov as *mut libc::iovec,
@@ -940,7 +1065,8 @@ pub(super) fn send_raw_wayland(fd: RawFd, data: &mut [u8]) -> bool {
         msg_controllen: 0,
         msg_flags: 0,
     };
-    let ret = call_sendmsg(fd, &msg as *const msghdr, 0);
+    // Use `libc::sendmsg` directly — we don't hook sendmsg anymore.
+    let ret = unsafe { libc::sendmsg(fd, &msg as *const msghdr, libc::MSG_NOSIGNAL) };
     ret as usize == data.len()
 }
 
@@ -1075,8 +1201,6 @@ pub(super) fn init_wayland_hook() {
 
     install_hook!(HOOK_CONNECT_ADDR, "connect", hook_connect);
     install_hook!(HOOK_CLOSE_ADDR, "close", hook_close);
-    install_hook!(HOOK_RECVMSG_ADDR, "recvmsg", hook_recvmsg);
-    install_hook!(HOOK_SENDMSG_ADDR, "sendmsg", hook_sendmsg);
 }
 
 /// Removes all installed Wayland hooks and resets all connection state.
@@ -1122,12 +1246,6 @@ pub(super) fn remove_wayland_hook() {
         && let Ok(mut cbs) = m.lock()
     {
         cbs.clear();
-    }
-    if let Some(addr) = HOOK_SENDMSG_ADDR.get() {
-        let _ = unhook(*addr);
-    }
-    if let Some(addr) = HOOK_RECVMSG_ADDR.get() {
-        let _ = unhook(*addr);
     }
     if let Some(addr) = HOOK_CLOSE_ADDR.get() {
         let _ = unhook(*addr);
