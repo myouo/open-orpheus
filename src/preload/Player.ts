@@ -218,6 +218,7 @@ export default class Player extends EventTarget {
   constructor() {
     super();
 
+    this._audio.crossOrigin = "anonymous";
     this._audio.volume = 1;
 
     this._audioSourceNode.connect(this._gainNode);
