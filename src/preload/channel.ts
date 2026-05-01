@@ -3,7 +3,7 @@ import { dispatcher } from "./calls";
 
 import "./calls/index";
 
-const CALL_DEBUG = true; // Set to true to enable debug logs for channel.call
+const CALL_DEBUG = false; // Set to true to enable debug logs for channel.call
 let _callDebugId = 0;
 
 const nativeCallbacks = new Map<string, (...args: unknown[]) => void>();
