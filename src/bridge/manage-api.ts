@@ -1,4 +1,4 @@
-import { UpdateInfo } from "../main/update";
+import type { UpdateInfo } from "../main/update";
 
 export interface CacheGroupStats {
   entryCount: number;
