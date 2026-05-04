@@ -4,17 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version (e.g. 0.10.2)'
+        description: "Version (e.g. 0.10.2)"
         required: true
       pre_release:
-        description: 'Mark as pre-release'
+        description: "Mark as pre-release"
         type: boolean
         default: false
       discussion_category:
-        description: 'GitHub Discussions category name (omit to skip)'
+        description: "GitHub Discussions category name (omit to skip)"
         required: false
         type: string
-        default: ''
+        default: ""
 
 jobs:
   prepare:
