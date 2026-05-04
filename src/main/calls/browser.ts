@@ -39,7 +39,7 @@ registerCallHandler<[string], [FullCookie[]]>(
       (await getFullCookies(url)).map((cookie) => ({
         Creation: Date.now() / 1000,
         Domain: cookie.domain || "",
-        Expires: (cookie.expirationDate?.valueOf() || Date.now()) / 1000,
+        Expires: cookie.expirationDate || Date.now() / 1000,
         HasExpires: cookie.expirationDate !== undefined ? 1 : 0,
         Httponly: cookie.httpOnly ? 1 : 0,
         LastAccess: Date.now() / 1000,
