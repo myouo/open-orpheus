@@ -8,15 +8,21 @@ type SetCookie = {
   Value: string;
   Path?: string;
   Url: string;
+  Creation?: number;
+  Expires?: number;
+  HasExpires?: 0 | 1;
+  Httponly?: 0 | 1;
+  LastAccess?: number;
+  Secure?: 0 | 1;
   ["max-age"]?: number;
-  samsite?: "strict";
+  samesite?: "strict";
 };
 
 type FullCookie = {
   Creation: number;
   Domain: string;
   Expires: number;
-  HasExpires: number;
+  HasExpires: 0 | 1;
   Httponly: number;
   LastAccess: number;
   Name: string;
@@ -31,12 +37,12 @@ registerCallHandler<[string], [FullCookie[]]>(
     // TODO: We might need to know when the cookie was actually created/last accessed and what's the original URL.
     return [
       (await getFullCookies(url)).map((cookie) => ({
-        Creation: Date.now(),
+        Creation: Date.now() / 1000,
         Domain: cookie.domain || "",
-        Expires: cookie.expirationDate?.valueOf() || Date.now(),
+        Expires: (cookie.expirationDate?.valueOf() || Date.now()) / 1000,
         HasExpires: cookie.expirationDate !== undefined ? 1 : 0,
         Httponly: cookie.httpOnly ? 1 : 0,
-        LastAccess: Date.now(),
+        LastAccess: Date.now() / 1000,
         Name: cookie.name,
         Path: cookie.path || "/",
         Secure: cookie.secure ? 1 : 0,
@@ -72,8 +78,15 @@ registerCallHandler<[SetCookie], [boolean]>(
         value: cookie.Value,
         domain: cookie.Domain,
         path: cookie.Path,
+        httpOnly:
+          cookie.Httponly !== undefined ? cookie.Httponly === 1 : undefined,
+        expires:
+          cookie.HasExpires && cookie.Expires
+            ? new Date(cookie.Expires * 1000)
+            : undefined,
+        secure: cookie.Secure !== undefined ? cookie.Secure === 1 : undefined,
         maxAge: cookie["max-age"],
-        sameSite: cookie.samsite,
+        sameSite: cookie.samesite,
       });
     } catch (error) {
       console.error(`Error setting cookie: ${stringifyError(error)}`);
