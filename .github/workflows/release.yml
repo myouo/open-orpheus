@@ -20,6 +20,10 @@ on:
         required: false
         type: string
         default: ""
+      skip_commit:
+        description: "Skip the version-bump commit (use when already committed manually)"
+        type: boolean
+        default: false
 
 jobs:
   prepare:
@@ -38,6 +42,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update version in package.json
+        if: ${{ !inputs.skip_commit }}
         run: |
           jq --arg v "${{ inputs.version }}" '.version = $v' package.json > tmp.json
           mv tmp.json package.json
@@ -73,6 +78,7 @@ jobs:
             ${{ inputs.discussion_category && format('--discussion-category "{0}"', inputs.discussion_category) || '' }}
 
       - name: Fetch auto-generated release notes
+        if: ${{ !inputs.skip_commit }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -81,6 +87,7 @@ jobs:
             -q '.body' > /tmp/release-notes.md
 
       - name: Generate metainfo descriptions via DeepSeek
+        if: ${{ !inputs.skip_commit }}
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
@@ -104,6 +111,7 @@ jobs:
               -d @- | jq -r '.choices[0].message.content' > /tmp/deepseek.raw
 
       - name: Update metainfo.xml
+        if: ${{ !inputs.skip_commit }}
         run: |
           python3 << 'PYEOF'
           import json
@@ -172,14 +180,17 @@ jobs:
           PYEOF
 
       - name: Commit and push
-        id: push
+        if: ${{ !inputs.skip_commit }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add package.json packaging/flatpak/metainfo.xml
           git commit -m "chore: bump version to ${{ inputs.version }}"
           git push origin main
-          echo "commit-sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Capture commit SHA
+        id: push
+        run: echo "commit-sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
   build:
     name: Build ${{ matrix.runner }}
@@ -246,6 +257,24 @@ jobs:
             ${{ inputs.pre_release && '--prerelease' || '' }}
 
       - name: Trigger Flathub publish workflow
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run flathub.yml --ref main
+
+  cleanup:
+    name: Clean up draft release on failure
+    needs: [prepare, build, publish]
+    if: failure() || cancelled()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Delete draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "v${{ inputs.version }}" --json isDraft -q '.isDraft' 2>/dev/null | grep -q true; then
+            echo "Deleting draft release v${{ inputs.version }}"
+            gh release delete "v${{ inputs.version }}" --yes
+          fi

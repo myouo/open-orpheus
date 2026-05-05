@@ -51,6 +51,12 @@ jobs:
           sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           sudo flatpak install -y flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08 org.electronjs.Electron2.BaseApp//25.08
 
+      - name: Validate metainfo
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y appstream
+          appstreamcli validate packaging/flatpak/metainfo.xml
+
       - name: Build application bundles
         run: pnpm make
 
