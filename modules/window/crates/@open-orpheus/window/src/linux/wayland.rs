@@ -172,7 +172,6 @@ const WL_POINTER_RELEASE: u16 = 1;
 const REQ_DESTROY: u16 = 0;
 const REQ_REGION_DESTROY: u16 = 0;
 const REQ_REGION_ADD: u16 = 1;
-const REQ_REGION_SUBTRACT: u16 = 2;
 
 // ── Wire helpers ──────────────────────────────────────────────────────────
 
