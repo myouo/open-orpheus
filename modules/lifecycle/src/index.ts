@@ -1,5 +1,3 @@
-import { ProcessEventMap } from "node:process";
-
 export type FinalizerToken = object;
 
 type FinalizationRegistryHandler = {
@@ -83,8 +81,6 @@ export function unregisterFinalizer(token: FinalizerToken): void {
   }
 }
 
-type ExitListener = (...args: ProcessEventMap["exit"]) => unknown;
-
 /**
  * An alias to `process.on("exit", callback)`.
  *
@@ -92,7 +88,7 @@ type ExitListener = (...args: ProcessEventMap["exit"]) => unknown;
  * if the process is killed by a signal. The callback will be called after all finalizers are called.
  * @param callback
  */
-export function onExit(callback: ExitListener): void {
+export function onExit(callback: NodeJS.ExitListener): void {
   process.on("exit", callback);
 }
 
@@ -102,6 +98,6 @@ export function onExit(callback: ExitListener): void {
  * See {@link onExit} for details.
  * @param callback
  */
-export function offExit(callback: ExitListener): void {
+export function offExit(callback: NodeJS.ExitListener): void {
   process.off("exit", callback);
 }
