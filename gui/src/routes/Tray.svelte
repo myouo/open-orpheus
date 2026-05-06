@@ -1,5 +1,6 @@
 <script lang="ts">
   import * as RadioGroup from "$lib/components/ui/radio-group";
+  import * as Select from "$lib/components/ui/select";
   import * as Field from "$lib/components/ui/field";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
@@ -16,6 +17,11 @@
     | "depends-on-main-window"
     | "always-show-menu"
     | "with-native-menu";
+  type SelectOption = {
+    value: string;
+    label: string;
+  };
+  const DEFAULT_FONT_SELECT_VALUE = "__default-font__";
 
   let clickBehaviorPromise = $state(kv.get("tray.clickBehavior"));
   let trayLyricsEnabledPromise = $state(kv.get("trayLyrics.enabled"));
@@ -84,6 +90,38 @@
       trayLyricsStyleDraft = { ...style };
       return style;
     });
+  }
+
+  function getTrayLyricsFontOptions(
+    systemFonts: string[],
+    currentFontFamily: string
+  ): SelectOption[] {
+    const options: SelectOption[] = [
+      { value: DEFAULT_FONT_SELECT_VALUE, label: "默认字体" },
+    ];
+
+    if (currentFontFamily && !systemFonts.includes(currentFontFamily)) {
+      options.push({
+        value: currentFontFamily,
+        label: currentFontFamily,
+      });
+    }
+
+    return options.concat(
+      systemFonts.map((font) => ({ value: font, label: font }))
+    );
+  }
+
+  function getTrayLyricsFontLabel(fontFamily: string) {
+    return fontFamily || "默认字体";
+  }
+
+  function getTrayLyricsFontSelectValue(fontFamily: string) {
+    return fontFamily || DEFAULT_FONT_SELECT_VALUE;
+  }
+
+  function getTrayLyricsFontFamilyFromSelectValue(value: string) {
+    return value === DEFAULT_FONT_SELECT_VALUE ? "" : value;
   }
 
   function setTrayLyricsEnabled(enabled: boolean) {
@@ -208,29 +246,44 @@
       </Field.Content>
       <div class="grid w-72 gap-2">
         {#await systemFontsPromise}
-          <select
-            aria-label="状态栏歌词字体"
-            class="h-9 w-full min-w-0 rounded-md border border-input bg-transparent px-2.5 py-1 text-base shadow-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50 md:text-sm"
+          <Select.Root
+            type="single"
+            value=""
             disabled
+            items={[{ value: "", label: "正在读取字体" }]}
           >
-            <option>正在读取字体</option>
-          </select>
+            <Select.Trigger aria-label="状态栏歌词字体" class="w-full">
+              正在读取字体
+            </Select.Trigger>
+          </Select.Root>
         {:then systemFonts}
-          <select
-            aria-label="状态栏歌词字体"
-            class="h-9 w-full min-w-0 rounded-md border border-input bg-transparent px-2.5 py-1 text-base shadow-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 md:text-sm"
-            bind:value={trayLyricsStyleDraft.fontFamily}
+          {@const fontOptions = getTrayLyricsFontOptions(
+            systemFonts,
+            trayLyricsStyleDraft.fontFamily
+          )}
+          <Select.Root
+            type="single"
+            bind:value={
+              () =>
+                getTrayLyricsFontSelectValue(trayLyricsStyleDraft.fontFamily),
+              (value) => {
+                trayLyricsStyleDraft.fontFamily =
+                  getTrayLyricsFontFamilyFromSelectValue(value);
+              }
+            }
+            items={fontOptions}
           >
-            <option value="">默认字体</option>
-            {#if trayLyricsStyleDraft.fontFamily && !systemFonts.includes(trayLyricsStyleDraft.fontFamily)}
-              <option value={trayLyricsStyleDraft.fontFamily}>
-                {trayLyricsStyleDraft.fontFamily}
-              </option>
-            {/if}
-            {#each systemFonts as font (font)}
-              <option value={font}>{font}</option>
-            {/each}
-          </select>
+            <Select.Trigger aria-label="状态栏歌词字体" class="w-full">
+              {getTrayLyricsFontLabel(trayLyricsStyleDraft.fontFamily)}
+            </Select.Trigger>
+            <Select.Content>
+              {#each fontOptions as option (option.value || "__default-font")}
+                <Select.Item value={option.value} label={option.label}>
+                  {option.label}
+                </Select.Item>
+              {/each}
+            </Select.Content>
+          </Select.Root>
         {:catch}
           <Input
             aria-label="状态栏歌词字体"
