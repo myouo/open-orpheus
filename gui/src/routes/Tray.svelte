@@ -31,9 +31,9 @@
           needsSessionRestart: false,
         })
   );
-  let extensionInstallPromise = $state<
-    ReturnType<ManageContract["trayLyrics"]["installExtension"]> | null
-  >(null);
+  let extensionInstallPromise = $state<ReturnType<
+    ManageContract["trayLyrics"]["installExtension"]
+  > | null>(null);
   let extensionInstalling = $state(false);
   let trayLyricsStyleDraft = $state<TrayLyricsStyle>({
     fontFamily: "",
@@ -138,7 +138,9 @@
         </Field.Description>
         {#if extensionInstallPromise}
           {#await extensionInstallPromise}
-            <Field.Description>正在安装并启用 GNOME Shell 扩展…</Field.Description>
+            <Field.Description
+              >正在安装并启用 GNOME Shell 扩展…</Field.Description
+            >
           {:then result}
             <Field.Description>
               {result.message}
@@ -200,8 +202,8 @@
       <Field.Content>
         <Field.Title>状态栏歌词样式</Field.Title>
         <Field.Description>
-          字体留空使用 GNOME Shell 默认字体；显示颜色支持 #RGB、#RRGGBB、RGB
-          或 RRGGBB，留空使用当前 Shell 主题颜色。
+          字体留空使用 GNOME Shell 默认字体；显示颜色支持 #RGB、#RRGGBB、RGB 或
+          RRGGBB，留空使用当前 Shell 主题颜色。
         </Field.Description>
       </Field.Content>
       <div class="grid w-72 gap-2">
@@ -220,8 +222,7 @@
             bind:value={trayLyricsStyleDraft.fontFamily}
           >
             <option value="">默认字体</option>
-            {#if trayLyricsStyleDraft.fontFamily &&
-              !systemFonts.includes(trayLyricsStyleDraft.fontFamily)}
+            {#if trayLyricsStyleDraft.fontFamily && !systemFonts.includes(trayLyricsStyleDraft.fontFamily)}
               <option value={trayLyricsStyleDraft.fontFamily}>
                 {trayLyricsStyleDraft.fontFamily}
               </option>

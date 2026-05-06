@@ -15,10 +15,7 @@ const execFileAsync = promisify(execFile);
 
 const EXTENSION_UUID = "open-orpheus-tray-lyrics@open-orpheus";
 const EXTENSION_VERSION = 3;
-const EXTENSION_SOURCE_DIR = path.join(
-  "gnome-shell-extension",
-  EXTENSION_UUID
-);
+const EXTENSION_SOURCE_DIR = path.join("gnome-shell-extension", EXTENSION_UUID);
 
 export async function isTrayLyricsExtensionInstalled(): Promise<boolean> {
   if (os.platform() !== "linux") return false;
@@ -86,7 +83,9 @@ export async function installTrayLyricsExtension(): Promise<TrayLyricsExtensionI
   }
 
   const sourceDir = getExtensionSourceDir();
-  const outDir = await mkdtemp(path.join(os.tmpdir(), "open-orpheus-gnome-ext-"));
+  const outDir = await mkdtemp(
+    path.join(os.tmpdir(), "open-orpheus-gnome-ext-")
+  );
 
   try {
     await run("gnome-extensions", ["pack", "-f", "-o", outDir, sourceDir]);

@@ -435,7 +435,9 @@ const TrayLyricsIndicator = GObject.registerClass(
 
       this._pendingColor = this._rgbToHex(r, g, b);
       if (this._colorPreview) {
-        this._colorPreview.set_style(`background-color: ${this._pendingColor};`);
+        this._colorPreview.set_style(
+          `background-color: ${this._pendingColor};`
+        );
       }
     }
 
