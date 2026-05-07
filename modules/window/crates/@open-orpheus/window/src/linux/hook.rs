@@ -107,11 +107,10 @@ fn forward_msg(from: RawFd, to: RawFd, is_event: bool, app_fd: RawFd, proto: Pro
     let mut out_data = match proto {
         Protocol::Wayland => {
             if is_event {
-                super::wayland::feed_inbound(app_fd, data);
+                super::wayland::feed_inbound(app_fd, data)
             } else {
-                super::wayland::feed_outbound(app_fd, data);
+                super::wayland::feed_outbound(app_fd, data)
             }
-            data.to_vec()
         }
         Protocol::X11 => {
             if is_event {

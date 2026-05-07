@@ -14,6 +14,34 @@
   let playing = $state(false);
   let locked = $state(false);
   let unlockButton: HTMLButtonElement | null = $state(null);
+  let rootEl: HTMLDivElement | null = $state(null);
+
+  function updateUnlockInputRegion() {
+    if (!unlockButton) {
+      api.setInputRegion(0, 0, 0, 0);
+      return;
+    }
+    const r = unlockButton.getBoundingClientRect();
+    api.setInputRegion(r.x, r.y, r.width, r.height);
+  }
+
+  $effect(() => {
+    const btn = unlockButton;
+    const root = rootEl;
+    if (locked && btn && root) {
+      updateUnlockInputRegion();
+
+      const observer = new ResizeObserver(() => updateUnlockInputRegion());
+      observer.observe(root);
+      observer.observe(btn);
+      return () => {
+        observer.disconnect();
+        api.setInputRegion(0, 0, 0, 0);
+      };
+    } else {
+      api.setInputRegion(0, 0, 0, 0);
+    }
+  });
 
   const items: ([string, string, string] | [string, string, string, true])[] =
     $derived([
@@ -131,6 +159,7 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
+  bind:this={rootEl}
   class={cn(
     "group flex h-screen w-screen items-center justify-evenly overflow-hidden rounded-lg p-2 select-none",
     !locked && "hover:bg-black/40"
@@ -149,6 +178,11 @@
         bind:this={unlockButton}
         class="size-12 cursor-pointer"
         onclick={() => api.performAction("unlock")}
+        // On Windows/macOS, we use Electron's `setIgnoreMouseEvent`, so we need to take input back
+        onmouseenter={() =>
+          api.platform !== "linux" && api.setInputRegion(0, 0, 0, 0)}
+        onmouseleave={() =>
+          api.platform !== "linux" && updateUnlockInputRegion()}
         title="解锁桌面歌词"
         ><img
           src="gui://skin/lrc/desk_icn_unlock.png"

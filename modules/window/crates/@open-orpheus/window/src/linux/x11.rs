@@ -15,7 +15,8 @@ enum State {
 
 #[derive(PartialEq, Clone, Copy)]
 enum InjectedType {
-    InternAtom,
+    InternAtomNetWmMoveresize,
+    QueryExtensionShape,
     Other,
 }
 
@@ -26,10 +27,13 @@ struct X11Conn {
     tx_buf: Vec<u8>,
     rx_buf: Vec<u8>,
     is_le: bool,
+    client_seq: u16,
     server_seq: u16,
     seq_offset: u16,
+    offset_transitions: Vec<(u16, u16)>, // (first_wire_seq_affected, offset_to_apply)
     injected_seqs: HashMap<u16, InjectedType>,
     net_wm_moveresize: Option<u32>,
+    shape_opcode: Option<u8>,
     root_window: u32,
     root_x: i16,
     root_y: i16,
@@ -45,10 +49,13 @@ impl X11Conn {
             tx_buf: Vec::new(),
             rx_buf: Vec::new(),
             is_le: true,
+            client_seq: 0,
             server_seq: 0,
             seq_offset: 0,
+            offset_transitions: vec![(0, 0)],
             injected_seqs: HashMap::new(),
             net_wm_moveresize: None,
+            shape_opcode: None,
             root_window: 0,
             root_x: 0,
             root_y: 0,
@@ -59,11 +66,7 @@ impl X11Conn {
 
 static IS_X11: OnceLock<bool> = OnceLock::new();
 static X11_CONNS: OnceLock<Mutex<HashMap<RawFd, X11Conn>>> = OnceLock::new();
-
-/// Tracks the application side FD of the most recent active X11 connection.
 static LAST_ACTIVE_FD: OnceLock<Mutex<Option<RawFd>>> = OnceLock::new();
-
-// ── Wire formatting helpers ────────────────────────────────────────────────
 
 #[inline]
 fn r16(b: &[u8], le: bool) -> u16 {
@@ -101,8 +104,6 @@ fn update_last_active_fd(fd: RawFd) {
     }
 }
 
-// ── Stream parsers & Rewriters ─────────────────────────────────────────────
-
 pub(crate) fn feed_inbound(fd: RawFd, chunk: &[u8]) -> Vec<u8> {
     update_last_active_fd(fd);
     let Some(m) = X11_CONNS.get() else {
@@ -125,15 +126,11 @@ pub(crate) fn feed_inbound(fd: RawFd, chunk: &[u8]) -> Vec<u8> {
                 break;
             }
             let status = conn.rx_buf[off];
-
             let total = if status == 1 || status == 2 {
-                // Success or Authenticate
                 8 + (r16(&conn.rx_buf[off + 6..off + 8], conn.is_le) as usize) * 4
             } else {
-                // Failed
                 8 + ((conn.rx_buf[off + 1] as usize + 3) & !3)
             };
-
             if conn.rx_buf.len() - off < total {
                 break;
             }
@@ -150,24 +147,6 @@ pub(crate) fn feed_inbound(fd: RawFd, chunk: &[u8]) -> Vec<u8> {
 
             conn.rx_state = State::Connected;
             out.extend_from_slice(&conn.rx_buf[off..off + total]);
-
-            if status == 1 {
-                // Silently inject InternAtom request (28 bytes padded)
-                let mut req = [0u8; 28];
-                req[0] = 16;
-                req[1] = 0;
-                write_u16(&mut req[2..4], 7, conn.is_le);
-                write_u16(&mut req[4..6], 18, conn.is_le);
-                req[8..26].copy_from_slice(b"_NET_WM_MOVERESIZE");
-
-                conn.server_seq = conn.server_seq.wrapping_add(1);
-                conn.seq_offset = conn.seq_offset.wrapping_add(1);
-                conn.injected_seqs
-                    .insert(conn.server_seq, InjectedType::InternAtom);
-
-                super::hook::send_raw_msg(conn.real_fd, &req);
-            }
-
             off += total;
         } else {
             if conn.rx_buf.len() - off < 32 {
@@ -175,7 +154,6 @@ pub(crate) fn feed_inbound(fd: RawFd, chunk: &[u8]) -> Vec<u8> {
             }
             let code = conn.rx_buf[off];
             let is_reply_or_error = code == 0 || code == 1;
-            let _is_event = code >= 2;
 
             let total = match code & 0x7F {
                 1 | 35 => 32 + (r32(&conn.rx_buf[off + 4..off + 8], conn.is_le) as usize) * 4,
@@ -191,55 +169,61 @@ pub(crate) fn feed_inbound(fd: RawFd, chunk: &[u8]) -> Vec<u8> {
 
             if is_reply_or_error && let Some(inj_type) = conn.injected_seqs.remove(&seq) {
                 drop = true;
-                if code == 1 && inj_type == InjectedType::InternAtom {
-                    conn.net_wm_moveresize = Some(r32(&msg[8..12], conn.is_le));
+                if code == 1 {
+                    match inj_type {
+                        InjectedType::InternAtomNetWmMoveresize => {
+                            conn.net_wm_moveresize = Some(r32(&msg[8..12], conn.is_le));
+                        }
+                        InjectedType::QueryExtensionShape => {
+                            let present = msg[8] != 0;
+                            if present {
+                                conn.shape_opcode = Some(msg[9]);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
 
             if !drop {
                 let evt_code = code & 0x7F;
 
-                // KeymapNotify (11) is the only event without a sequence number
-                if conn.seq_offset > 0 && evt_code != 11 {
-                    let new_seq = seq.wrapping_sub(conn.seq_offset);
-                    write_u16(&mut msg[2..4], new_seq, conn.is_le);
+                if evt_code != 11 {
+                    // KeymapNotify is unsequenced
+                    let mut applied_offset = 0;
+                    for &(transition_seq, offset) in &conn.offset_transitions {
+                        if seq.wrapping_sub(transition_seq) < 32768 {
+                            applied_offset = offset;
+                        }
+                    }
+                    if applied_offset > 0 {
+                        let new_seq = seq.wrapping_sub(applied_offset);
+                        write_u16(&mut msg[2..4], new_seq, conn.is_le);
+                    }
                 }
 
-                // Track absolute coordinates
                 if evt_code == 4 || evt_code == 5 || evt_code == 6 {
-                    // Legacy Core X11 Pointer Events
                     conn.root_window = r32(&msg[8..12], conn.is_le);
                     if evt_code == 4 {
-                        // ButtonPress
                         conn.button = msg[1];
                         conn.root_x = r16(&msg[20..22], conn.is_le) as i16;
                         conn.root_y = r16(&msg[22..24], conn.is_le) as i16;
                     }
-                } else if evt_code == 35 {
-                    // XInput2 GenericEvents (Modern Qt/GTK)
-                    if msg.len() >= 40 {
-                        let evtype = r16(&msg[8..10], conn.is_le);
-                        if evtype == 4 || evtype == 5 || evtype == 6 {
-                            // XI_ButtonPress/Release/Motion
-                            conn.root_window = r32(&msg[20..24], conn.is_le);
-                            if evtype == 4 {
-                                // XI_ButtonPress
-                                conn.button = r32(&msg[16..20], conn.is_le) as u8;
-
-                                // XInput2 uses 32-bit fixed point (16.16) coordinates. We shift right by 16
-                                // to convert them back to standard integers (retaining the sign bit).
-                                let rx_fp = r32(&msg[32..36], conn.is_le) as i32;
-                                let ry_fp = r32(&msg[36..40], conn.is_le) as i32;
-                                conn.root_x = (rx_fp >> 16) as i16;
-                                conn.root_y = (ry_fp >> 16) as i16;
-                            }
+                } else if evt_code == 35 && msg.len() >= 40 {
+                    let evtype = r16(&msg[8..10], conn.is_le);
+                    if evtype == 4 || evtype == 5 || evtype == 6 {
+                        conn.root_window = r32(&msg[20..24], conn.is_le);
+                        if evtype == 4 {
+                            conn.button = r32(&msg[16..20], conn.is_le) as u8;
+                            let rx_fp = r32(&msg[32..36], conn.is_le) as i32;
+                            let ry_fp = r32(&msg[36..40], conn.is_le) as i32;
+                            conn.root_x = (rx_fp >> 16) as i16;
+                            conn.root_y = (ry_fp >> 16) as i16;
                         }
                     }
                 }
-
                 out.extend_from_slice(&msg);
             }
-
             off += total;
         }
     }
@@ -283,6 +267,31 @@ pub(crate) fn feed_outbound(fd: RawFd, chunk: &[u8]) -> Vec<u8> {
             conn.tx_state = State::Connected;
             out.extend_from_slice(&conn.tx_buf[off..off + total]);
             off += total;
+
+            let mut req1 = [0u8; 28];
+            req1[0] = 16;
+            write_u16(&mut req1[2..4], 7, conn.is_le);
+            write_u16(&mut req1[4..6], 18, conn.is_le);
+            req1[8..26].copy_from_slice(b"_NET_WM_MOVERESIZE");
+            conn.server_seq = conn.server_seq.wrapping_add(1);
+            conn.seq_offset = conn.seq_offset.wrapping_add(1);
+            conn.injected_seqs
+                .insert(conn.server_seq, InjectedType::InternAtomNetWmMoveresize);
+            out.extend_from_slice(&req1);
+
+            let mut req2 = [0u8; 16];
+            req2[0] = 98; // QueryExtension
+            write_u16(&mut req2[2..4], 4, conn.is_le);
+            write_u16(&mut req2[4..6], 5, conn.is_le);
+            req2[8..13].copy_from_slice(b"SHAPE");
+            conn.server_seq = conn.server_seq.wrapping_add(1);
+            conn.seq_offset = conn.seq_offset.wrapping_add(1);
+            conn.injected_seqs
+                .insert(conn.server_seq, InjectedType::QueryExtensionShape);
+            out.extend_from_slice(&req2);
+
+            conn.offset_transitions
+                .push((conn.server_seq.wrapping_add(1), conn.seq_offset));
         } else {
             if conn.tx_buf.len() - off < 4 {
                 break;
@@ -301,6 +310,7 @@ pub(crate) fn feed_outbound(fd: RawFd, chunk: &[u8]) -> Vec<u8> {
                 break;
             }
 
+            conn.client_seq = conn.client_seq.wrapping_add(1);
             conn.server_seq = conn.server_seq.wrapping_add(1);
             out.extend_from_slice(&conn.tx_buf[off..off + total]);
             off += total;
@@ -313,8 +323,6 @@ pub(crate) fn feed_outbound(fd: RawFd, chunk: &[u8]) -> Vec<u8> {
     }
     out
 }
-
-// ── Public APIs ────────────────────────────────────────────────────────────
 
 pub(crate) fn is_x11_socket(addr: *const c_void, addrlen: u32) -> bool {
     if addr.is_null() || (addrlen as usize) < mem::size_of::<sa_family_t>() {
@@ -341,7 +349,6 @@ pub(crate) fn is_x11_socket(addr: *const c_void, addrlen: u32) -> bool {
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         &raw[..end]
     };
-
     candidate.windows(11).any(|w| w == b".X11-unix/X")
 }
 
@@ -373,8 +380,6 @@ pub(super) fn is_x11() -> bool {
     *IS_X11.get().unwrap_or(&false)
 }
 
-/// Sends an interactive move command strictly using the captured connection.
-/// Actively injects `UngrabPointer` first, followed by `SendEvent(ClientMessage)`.
 pub(super) fn send_net_wm_moveresize_move(window: u32) -> bool {
     let fd = {
         let Some(m) = LAST_ACTIVE_FD.get() else {
@@ -401,11 +406,9 @@ pub(super) fn send_net_wm_moveresize_move(window: u32) -> bool {
         };
 
         let Some(atom) = conn.net_wm_moveresize else {
-            eprintln!("[x11] Failed to retrieve _NET_WM_MOVERESIZE Atom during setup");
             return false;
         };
         if conn.root_window == 0 {
-            eprintln!("[x11] Failed to capture default Root Window ID");
             return false;
         }
 
@@ -415,6 +418,14 @@ pub(super) fn send_net_wm_moveresize_move(window: u32) -> bool {
             .insert(conn.server_seq.wrapping_sub(1), InjectedType::Other);
         conn.injected_seqs
             .insert(conn.server_seq, InjectedType::Other);
+
+        conn.offset_transitions
+            .push((conn.server_seq.wrapping_add(1), conn.seq_offset));
+        if conn.offset_transitions.len() > 32 {
+            conn.offset_transitions.drain(0..16);
+        }
+        conn.injected_seqs
+            .retain(|&k, _| conn.server_seq.wrapping_sub(k) < 32768);
 
         (
             conn.real_fd,
@@ -428,34 +439,116 @@ pub(super) fn send_net_wm_moveresize_move(window: u32) -> bool {
     };
 
     let mut payload = [0u8; 52];
+    payload[0] = 27;
+    write_u16(&mut payload[2..4], 2, is_le);
+    write_u32(&mut payload[4..8], 0, is_le);
 
-    // --- 1. UngrabPointer ---
-    payload[0] = 27; // Opcode
-    write_u16(&mut payload[2..4], 2, is_le); // Length (2 words)
-    write_u32(&mut payload[4..8], 0, is_le); // CurrentTime (0)
+    payload[8] = 25;
+    payload[9] = 0;
+    write_u16(&mut payload[10..12], 11, is_le);
+    write_u32(&mut payload[12..16], root, is_le);
+    write_u32(&mut payload[16..20], 0x180000, is_le);
 
-    // --- 2. SendEvent (ClientMessage) ---
-    payload[8] = 25; // Opcode
-    payload[9] = 0; // Propagate: False
-    write_u16(&mut payload[10..12], 11, is_le); // Length (11 words = 44 Bytes)
-    write_u32(&mut payload[12..16], root, is_le); // Target Window
-    write_u32(&mut payload[16..20], 0x180000, is_le); // SubstructureRedirectMask | SubstructureNotifyMask
-
-    // Event Payload (32 Bytes for ClientMessage)
-    payload[20] = 33; // Event Code
-    payload[21] = 32; // Format: 32-bit values
-    write_u16(&mut payload[22..24], 0, is_le); // Sequence (Ignored by server)
-    write_u32(&mut payload[24..28], window, is_le); // Message Window
-    write_u32(&mut payload[28..32], atom, is_le); // Message Type (Atom)
-
-    // Data Values
+    payload[20] = 33;
+    payload[21] = 32;
+    write_u16(&mut payload[22..24], 0, is_le);
+    write_u32(&mut payload[24..28], window, is_le);
+    write_u32(&mut payload[28..32], atom, is_le);
     write_u32(&mut payload[32..36], root_x as u32, is_le);
     write_u32(&mut payload[36..40], root_y as u32, is_le);
-    write_u32(&mut payload[40..44], 8, is_le); // Direction: _NET_WM_MOVERESIZE_MOVE = 8
-    write_u32(&mut payload[44..48], button as u32, is_le); // Captured Pointer Button
-    write_u32(&mut payload[48..52], 1, is_le); // Source indication: Normal Client = 1
+    write_u32(&mut payload[40..44], 8, is_le);
+    write_u32(&mut payload[44..48], button as u32, is_le);
+    write_u32(&mut payload[48..52], 1, is_le);
 
     super::hook::send_raw_msg(real_fd, &payload)
+}
+
+pub(super) fn set_input_region_rects(window: u32, rects: Option<&[super::Rect]>) -> bool {
+    let fd = {
+        let Some(m) = LAST_ACTIVE_FD.get() else {
+            return false;
+        };
+        let Ok(opt) = m.lock() else {
+            return false;
+        };
+        let Some(fd) = *opt else {
+            return false;
+        };
+        fd
+    };
+
+    let (real_fd, shape_opcode, is_le) = {
+        let Some(m) = X11_CONNS.get() else {
+            return false;
+        };
+        let Ok(mut map) = m.lock() else {
+            return false;
+        };
+        let Some(conn) = map.get_mut(&fd) else {
+            return false;
+        };
+
+        let Some(shape_opcode) = conn.shape_opcode else {
+            return false;
+        };
+
+        conn.server_seq = conn.server_seq.wrapping_add(1);
+        conn.seq_offset = conn.seq_offset.wrapping_add(1);
+        conn.injected_seqs
+            .insert(conn.server_seq, InjectedType::Other);
+
+        conn.offset_transitions
+            .push((conn.server_seq.wrapping_add(1), conn.seq_offset));
+        if conn.offset_transitions.len() > 32 {
+            conn.offset_transitions.drain(0..16);
+        }
+        conn.injected_seqs
+            .retain(|&k, _| conn.server_seq.wrapping_sub(k) < 32768);
+
+        (conn.real_fd, shape_opcode, conn.is_le)
+    };
+
+    if let Some(rects) = rects {
+        let num_rects = rects.len();
+        let length = 4 + num_rects * 2;
+        let mut payload = vec![0u8; length * 4];
+
+        payload[0] = shape_opcode;
+        payload[1] = 1; // ShapeRectangles
+        write_u16(&mut payload[2..4], length as u16, is_le);
+        payload[4] = 0; // operation = ShapeSet
+        payload[5] = 2; // destination_kind = ShapeInput
+        payload[6] = 0; // ordering = UnSorted
+        payload[7] = 0; // pad
+        write_u32(&mut payload[8..12], window, is_le);
+        write_u16(&mut payload[12..14], 0, is_le); // x_offset
+        write_u16(&mut payload[14..16], 0, is_le); // y_offset
+
+        for (i, r) in rects.iter().enumerate() {
+            let off = 16 + i * 8;
+            write_u16(&mut payload[off..off + 2], r.x as u16, is_le);
+            write_u16(&mut payload[off + 2..off + 4], r.y as u16, is_le);
+            write_u16(&mut payload[off + 4..off + 6], r.w as u16, is_le);
+            write_u16(&mut payload[off + 6..off + 8], r.h as u16, is_le);
+        }
+        super::hook::send_raw_msg(real_fd, &payload)
+    } else {
+        let mut payload = [0u8; 20];
+
+        payload[0] = shape_opcode;
+        payload[1] = 2; // ShapeMask
+        write_u16(&mut payload[2..4], 5, is_le); // length: 5 words = 20 bytes
+        payload[4] = 0; // operation = ShapeSet
+        payload[5] = 2; // destination_kind = ShapeInput
+        payload[6] = 0; // pad
+        payload[7] = 0; // pad
+        write_u32(&mut payload[8..12], window, is_le);
+        write_u16(&mut payload[12..14], 0, is_le); // x_offset
+        write_u16(&mut payload[14..16], 0, is_le); // y_offset
+        write_u32(&mut payload[16..20], 0, is_le); // source_bitmap = None (0) defaults region reset
+
+        super::hook::send_raw_msg(real_fd, &payload)
+    }
 }
 
 pub(crate) fn init_state() {

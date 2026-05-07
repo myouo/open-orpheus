@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     mem,
     os::fd::RawFd,
     sync::{Mutex, OnceLock},
@@ -16,6 +16,9 @@ struct WaylandConn {
     xdg_to_wl: HashMap<u32, u32>,
     wl_to_top: HashMap<u32, u32>,
     top_to_xdg: HashMap<u32, u32>,
+    compositor_id: Option<u32>,
+    injected_ids: HashSet<u32>,
+    stolen_ids: Vec<u32>,
 }
 
 impl WaylandConn {
@@ -29,6 +32,9 @@ impl WaylandConn {
             xdg_to_wl: HashMap::new(),
             wl_to_top: HashMap::new(),
             top_to_xdg: HashMap::new(),
+            compositor_id: None,
+            injected_ids: HashSet::new(),
+            stolen_ids: Vec::new(),
         }
     }
 
@@ -40,6 +46,15 @@ impl WaylandConn {
         self.xdg_to_wl.clear();
         self.wl_to_top.clear();
         self.top_to_xdg.clear();
+        self.compositor_id = None;
+        self.injected_ids.clear();
+        self.stolen_ids.clear();
+    }
+
+    fn alloc_injected_id(&mut self) -> Option<u32> {
+        let id = self.stolen_ids.pop()?;
+        self.injected_ids.insert(id);
+        Some(id)
     }
 
     fn purge(&mut self, id: u32) {
@@ -143,6 +158,7 @@ const EVT_DELETE_ID: u16 = 1;
 const REQ_GET_REGISTRY: u16 = 1;
 const REQ_BIND: u16 = 0;
 const REQ_CREATE_SURFACE: u16 = 0;
+const REQ_CREATE_REGION: u16 = 1;
 const REQ_GET_POINTER: u16 = 0;
 const EVT_ENTER: u16 = 0;
 const EVT_LEAVE: u16 = 1;
@@ -151,8 +167,11 @@ const BTN_PRESSED: u32 = 1;
 const REQ_GET_XDG_SURFACE: u16 = 2;
 const REQ_GET_TOPLEVEL: u16 = 1;
 const REQ_MOVE: u16 = 5;
+const REQ_SET_INPUT_REGION: u16 = 5;
 const WL_POINTER_RELEASE: u16 = 1;
 const REQ_DESTROY: u16 = 0;
+const REQ_REGION_DESTROY: u16 = 0;
+const REQ_REGION_ADD: u16 = 1;
 
 // ── Wire helpers ──────────────────────────────────────────────────────────
 
@@ -214,12 +233,12 @@ fn parse_wl_str(buf: &[u8], offset: usize) -> Option<(&str, usize)> {
 
 // ── Stream reassembly ─────────────────────────────────────────────────────
 
-pub(crate) fn feed_inbound(fd: RawFd, chunk: &[u8]) {
-    feed(fd, chunk, &RX_BUFS, true);
+pub(crate) fn feed_inbound(fd: RawFd, chunk: &[u8]) -> Vec<u8> {
+    feed(fd, chunk, &RX_BUFS, true)
 }
 
-pub(crate) fn feed_outbound(fd: RawFd, chunk: &[u8]) {
-    feed(fd, chunk, &TX_BUFS, false);
+pub(crate) fn feed_outbound(fd: RawFd, chunk: &[u8]) -> Vec<u8> {
+    feed(fd, chunk, &TX_BUFS, false)
 }
 
 fn feed(
@@ -227,11 +246,15 @@ fn feed(
     chunk: &[u8],
     storage: &OnceLock<Mutex<HashMap<RawFd, Vec<u8>>>>,
     is_event: bool,
-) {
-    let Some(storage) = storage.get() else { return };
+) -> Vec<u8> {
+    let Some(storage) = storage.get() else {
+        return chunk.to_vec();
+    };
 
     let (msgs, sync_lost) = {
-        let Ok(mut map) = storage.lock() else { return };
+        let Ok(mut map) = storage.lock() else {
+            return chunk.to_vec();
+        };
         let buf = map.entry(fd).or_default();
         buf.extend_from_slice(chunk);
         let mut msgs = Vec::new();
@@ -254,12 +277,18 @@ fn feed(
         (msgs, sync_lost)
     };
 
+    let mut out = Vec::new();
     for (oid, op, msg) in msgs {
         if is_event {
+            let suppress = should_suppress_inbound(fd, oid, op, &msg);
             on_event(fd, oid, op, &msg);
+            if suppress {
+                continue;
+            }
         } else {
             on_request(fd, oid, op, &msg);
         }
+        out.extend_from_slice(&msg);
     }
 
     if sync_lost {
@@ -271,6 +300,39 @@ fn feed(
             conn.reset_tracking();
         }
     }
+
+    out
+}
+
+fn should_suppress_inbound(fd: RawFd, oid: u32, op: u16, msg: &[u8]) -> bool {
+    if oid == 1
+        && op == EVT_DELETE_ID
+        && let Some(dead) = ru32(msg, 8)
+    {
+        let Some(conns) = CONNS.get() else {
+            return false;
+        };
+        let Ok(mut guard) = conns.lock() else {
+            return false;
+        };
+        let Some(conn) = guard.get_mut(&fd) else {
+            return false;
+        };
+
+        // If it's one of our injected IDs, we're done with it.
+        // Push it back into the stolen pool so we can reuse it later!
+        if conn.injected_ids.remove(&dead) {
+            conn.stolen_ids.push(dead);
+            return true; // suppress from client
+        }
+
+        // Otherwise, steal up to 32 deleted IDs from the client for our own use.
+        if conn.stolen_ids.len() < 32 {
+            conn.stolen_ids.push(dead);
+            return true; // suppress from client
+        }
+    }
+    false
 }
 
 // ── Event / Request Handlers ──────────────────────────────────────────────
@@ -388,7 +450,10 @@ fn on_request(fd: RawFd, oid: u32, op: u16, msg: &[u8]) {
                     && let Some(new_id) = ru32(msg, after + 4)
                 {
                     let tag = match iface_name {
-                        "wl_compositor" => Some(Iface::WlCompositor),
+                        "wl_compositor" => {
+                            conn.compositor_id = Some(new_id);
+                            Some(Iface::WlCompositor)
+                        }
                         "wl_seat" => Some(Iface::WlSeat),
                         "xdg_wm_base" => Some(Iface::XdgWmBase),
                         _ => None,
@@ -690,6 +755,110 @@ pub(super) fn send_xdg_toplevel_move() -> bool {
     buf[12..16].copy_from_slice(&serial.to_ne_bytes());
 
     super::hook::send_raw_msg(fd, &buf)
+}
+
+// ── Input region APIs ──────────────────────────────────────────────────────
+
+fn window_id_to_fd_and_surface(window_id: &str) -> Option<(RawFd, u32)> {
+    let rest = window_id.strip_prefix("wayland:")?;
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let fd = parts[0].parse::<i32>().ok()?;
+    let wl_surface_id = parts[3].parse::<u32>().ok()?;
+    Some((fd, wl_surface_id))
+}
+
+fn create_region(fd: RawFd) -> Option<u32> {
+    let (compositor_id, region_id) = {
+        let conns = CONNS.get()?;
+        let Ok(mut guard) = conns.lock() else {
+            return None;
+        };
+        let conn = guard.get_mut(&fd)?;
+        let compositor_id = conn.compositor_id?;
+        let region_id = conn.alloc_injected_id()?;
+        (compositor_id, region_id)
+    };
+
+    let hdr_word = (REQ_CREATE_REGION as u32) | (12u32 << 16);
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&compositor_id.to_ne_bytes());
+    buf[4..8].copy_from_slice(&hdr_word.to_ne_bytes());
+    buf[8..12].copy_from_slice(&region_id.to_ne_bytes());
+
+    if !super::hook::send_raw_msg(fd, &buf) {
+        let conns = CONNS.get()?;
+        let Ok(mut guard) = conns.lock() else {
+            return None;
+        };
+        if let Some(conn) = guard.get_mut(&fd) {
+            conn.injected_ids.remove(&region_id);
+            // Return it to the pool if we failed to send
+            conn.stolen_ids.push(region_id);
+        }
+        return None;
+    }
+
+    Some(region_id)
+}
+
+fn region_add(fd: RawFd, region_id: u32, x: i32, y: i32, w: i32, h: i32) -> bool {
+    let hdr_word = (REQ_REGION_ADD as u32) | (24u32 << 16);
+    let mut buf = [0u8; 24];
+    buf[0..4].copy_from_slice(&region_id.to_ne_bytes());
+    buf[4..8].copy_from_slice(&hdr_word.to_ne_bytes());
+    buf[8..12].copy_from_slice(&x.to_ne_bytes());
+    buf[12..16].copy_from_slice(&y.to_ne_bytes());
+    buf[16..20].copy_from_slice(&w.to_ne_bytes());
+    buf[20..24].copy_from_slice(&h.to_ne_bytes());
+
+    super::hook::send_raw_msg(fd, &buf)
+}
+
+fn destroy_injected_region(fd: RawFd, region_id: u32) {
+    let hdr_word = (REQ_REGION_DESTROY as u32) | (8u32 << 16);
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&region_id.to_ne_bytes());
+    buf[4..8].copy_from_slice(&hdr_word.to_ne_bytes());
+
+    super::hook::send_raw_msg(fd, &buf);
+}
+
+pub(super) fn set_input_region_rects(window_id: &str, rects: Option<&[super::Rect]>) -> bool {
+    let (fd, wl_surface_id) = match window_id_to_fd_and_surface(window_id) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    let mut region_id = 0;
+
+    if let Some(rects) = rects {
+        if let Some(r_id) = create_region(fd) {
+            region_id = r_id;
+            for r in rects {
+                region_add(fd, region_id, r.x, r.y, r.w, r.h);
+            }
+        } else {
+            return false;
+        }
+    }
+
+    let hdr_word = (REQ_SET_INPUT_REGION as u32) | (12u32 << 16);
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&wl_surface_id.to_ne_bytes());
+    buf[4..8].copy_from_slice(&hdr_word.to_ne_bytes());
+    buf[8..12].copy_from_slice(&region_id.to_ne_bytes()); // "0" acts safely as null identifier
+
+    let res = super::hook::send_raw_msg(fd, &buf);
+
+    if region_id != 0 {
+        // Drop cache proxy directly. Re-allocation operates identically upon delete_id.
+        destroy_injected_region(fd, region_id);
+    }
+
+    res
 }
 
 pub(crate) fn init_state() {

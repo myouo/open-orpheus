@@ -4,8 +4,7 @@ use neon::{
     object::Object,
     prelude::{Context, Cx, JsFunction, ModuleContext},
     result::NeonResult,
-    types::JsValue,
-    types::{JsBuffer, buffer::TypedArray},
+    types::{JsArray, JsBuffer, JsNumber, JsObject, JsString, JsValue, buffer::TypedArray},
 };
 use std::sync::OnceLock;
 
@@ -27,8 +26,13 @@ fn disable_display_server_hooks() -> bool {
     })
 }
 
-// Both false -> we are not connecting to either display server,
-// so dragWindow will just fail gracefully
+#[derive(Clone, Copy)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
 
 #[neon::export]
 fn is_wayland() -> bool {
@@ -53,7 +57,7 @@ fn drag_window<'cx>(cx: &mut Cx<'cx>, handle: Handle<JsBuffer>) -> NeonResult<()
     }
 
     let buf = handle.as_slice(cx);
-    if buf.len() != 4 {
+    if buf.len() < 4 {
         let err_msg = cx.string("Invalid buffer size for window handle");
         return cx.throw(err_msg);
     }
@@ -71,6 +75,46 @@ fn drag_window<'cx>(cx: &mut Cx<'cx>, handle: Handle<JsBuffer>) -> NeonResult<()
     }
 
     Ok(())
+}
+
+#[neon::export]
+fn set_input_region<'cx>(
+    cx: &mut Cx<'cx>,
+    window_handle: Handle<'cx, JsValue>,
+    rects: Option<Handle<'cx, JsArray>>,
+) -> NeonResult<bool> {
+    let mut parsed_rects = None;
+    if let Some(arr) = rects {
+        let mut r = Vec::with_capacity(arr.len(cx) as usize);
+        for i in 0..arr.len(cx) {
+            let obj = arr.get::<JsObject, _, _>(cx, i)?;
+            let x = obj.get::<JsNumber, _, _>(cx, "x")?.value(cx) as i32;
+            let y = obj.get::<JsNumber, _, _>(cx, "y")?.value(cx) as i32;
+            let w = obj.get::<JsNumber, _, _>(cx, "w")?.value(cx) as i32;
+            let h = obj.get::<JsNumber, _, _>(cx, "h")?.value(cx) as i32;
+            r.push(Rect { x, y, w, h });
+        }
+        parsed_rects = Some(r);
+    }
+
+    if wayland::is_wayland() {
+        if window_handle.is_a::<JsString, _>(cx) {
+            let s = window_handle
+                .downcast_or_throw::<JsString, _>(cx)?
+                .value(cx);
+            return Ok(wayland::set_input_region_rects(&s, parsed_rects.as_deref()));
+        }
+    } else if x11::is_x11() && window_handle.is_a::<JsBuffer, _>(cx) {
+        let buf = window_handle.downcast_or_throw::<JsBuffer, _>(cx)?;
+        let slice = buf.as_slice(cx);
+        if slice.len() >= 4 {
+            // Modified to permit 8-byte Electron buffers directly natively
+            let window = u32::from_le_bytes(slice[0..4].try_into().unwrap());
+            return Ok(x11::set_input_region_rects(window, parsed_rects.as_deref()));
+        }
+    }
+
+    Ok(false)
 }
 
 #[neon::export]
