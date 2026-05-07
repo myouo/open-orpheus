@@ -1,4 +1,4 @@
-import type { LyricsData, LyricStyleConfig } from "../../gui/src/lib/types";
+import type { LyricsData, LyricStyleConfig } from "../../../gui/src/lib/types";
 
 export interface DesktopLyricsContract {
   platform: NodeJS.Platform;
