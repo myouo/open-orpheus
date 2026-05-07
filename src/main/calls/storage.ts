@@ -317,6 +317,7 @@ registerCallHandler<[string, boolean, string, number, string[]], void>(
   "storage.downloadscanner",
   (event, path, recursive, emptyStr, limit, excludes) => {
     (async () => {
+      path = normalizePath(path);
       const excludeSet = new Set(excludes.map((p) => normalizePath(path, p)));
       const batch: DownloadScannerItem[] = [];
 
@@ -343,10 +344,11 @@ registerCallHandler<[string, boolean, string, number, string[]], void>(
 
           if (!(await isMusicFile(entry.name))) continue;
 
-          const fullPath = normalizePath(path, join(path, entry.name));
+          const fullPath = normalizePath(entry.parentPath, entry.name);
           if (excludeSet.has(fullPath)) continue;
 
-          const info = await readDownloadedMusicInfo(entry.name, path);
+          const relToBase = fullPath.slice(path.length + 1);
+          const info = await readDownloadedMusicInfo(relToBase, path);
           if (!info) continue;
 
           batch.push(info);
