@@ -3,7 +3,7 @@
   import Lyrics from "$lib/components/Lyrics.svelte";
   import type { LyricsData, LyricStyleConfig } from "$lib/types";
   import { getBridge } from "$lib/bridge";
-  import type { DesktopLyricsPreviewContract } from "$bridge/desktop-lyrics-api";
+  import type { DesktopLyricsPreviewContract } from "$bridge/contracts/desktop-lyrics-api";
 
   const api = getBridge<DesktopLyricsPreviewContract>("desktopLyricsPreview");
 

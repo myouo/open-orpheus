@@ -8,7 +8,7 @@ import { wasm as wasmDir } from "../folders";
 import { lyricCacheManager, playCacheManager, urlCacheManager } from "../cache";
 import { checkUpdate } from "../update";
 import { registerIpcHandlers } from "../../bridge/register";
-import type { ManageContract } from "../../bridge/manage-api";
+import type { ManageContract } from "../../bridge/contracts/manage-api";
 
 let manageWndInstance: BrowserWindow | null = null;
 

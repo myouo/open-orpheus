@@ -9,7 +9,7 @@
   import Logo from "../../../assets/icon.svg";
 
   import { getBridge } from "$lib/bridge";
-  import type { ManageContract } from "$bridge/manage-api";
+  import type { ManageContract } from "$bridge/contracts/manage-api";
 
   const api = getBridge<ManageContract>("manage");
 

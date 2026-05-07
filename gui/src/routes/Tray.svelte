@@ -2,7 +2,7 @@
   import * as RadioGroup from "$lib/components/ui/radio-group";
   import * as Field from "$lib/components/ui/field";
   import { getBridge } from "$lib/bridge";
-  import type { ManageContract } from "$bridge/manage-api";
+  import type { ManageContract } from "$bridge/contracts/manage-api";
 
   const api = getBridge<ManageContract>("manage");
 

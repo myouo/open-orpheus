@@ -20,7 +20,7 @@ import {
 import packManager from "./pack";
 import SkinPack from "./packs/SkinPack";
 import { registerIpcHandlers } from "../bridge/register";
-import type { MenuContract } from "../bridge/menu-api";
+import type { MenuContract } from "../bridge/contracts/menu-api";
 
 registerMenuSkinUpdater();
 

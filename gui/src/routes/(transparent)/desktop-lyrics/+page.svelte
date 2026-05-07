@@ -5,7 +5,7 @@
   import IconButton from "$lib/components/IconButton.svelte";
   import { cn } from "$lib/utils";
   import { getBridge } from "$lib/bridge";
-  import type { DesktopLyricsContract } from "$bridge/desktop-lyrics-api";
+  import type { DesktopLyricsContract } from "$bridge/contracts/desktop-lyrics-api";
 
   const api = getBridge<DesktopLyricsContract>("desktopLyrics");
 

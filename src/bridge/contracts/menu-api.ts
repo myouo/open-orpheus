@@ -1,6 +1,6 @@
-import type { MenuSkin } from "../main/menu/types";
+import type { MenuSkin } from "../../main/menu/types";
 
-export type { MenuSkin } from "../main/menu/types";
+export type { MenuSkin } from "../../main/menu/types";
 
 export interface MenuPullResult {
   items: unknown[];

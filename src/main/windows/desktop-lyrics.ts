@@ -12,7 +12,7 @@ import { sanitizeRelativePath } from "../util";
 import { storage } from "../folders";
 import { quitting } from "../lifecycle";
 import { registerIpcHandlers } from "../../bridge/register";
-import type { DesktopLyricsContract } from "../../bridge/desktop-lyrics-api";
+import type { DesktopLyricsContract } from "../../bridge/contracts/desktop-lyrics-api";
 
 let desktopLyricsWindow: BrowserWindow | null = null;
 

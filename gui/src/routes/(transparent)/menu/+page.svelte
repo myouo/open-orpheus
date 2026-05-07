@@ -5,7 +5,7 @@
   import { loadTemplates } from "./template";
   import MenuPanel from "./MenuPanel.svelte";
   import { getBridge } from "$lib/bridge";
-  import type { MenuContract } from "$bridge/menu-api";
+  import type { MenuContract } from "$bridge/contracts/menu-api";
 
   const api = getBridge<MenuContract>("menu");
 
