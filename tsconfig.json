@@ -12,5 +12,6 @@
     "resolveJsonModule": true,
     "noEmit": true
   },
+  "include": ["src", "forge.env.d.ts"],
   "exclude": ["gui"]
 }
