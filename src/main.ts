@@ -248,7 +248,7 @@ app.on("ready", async () => {
               const srv = cfg[cfg.Type]!;
               app.setProxy({
                 mode: "fixed_servers",
-                proxyRules: `${cfg.Type}://${srv.Host}:${srv.Password}`,
+                proxyRules: `${cfg.Type}://${srv.Host}:${srv.Port}`,
               });
               if (srv.UserName || srv.Password) {
                 app.on("login", (event, wc, request, authInfo, callback) => {
