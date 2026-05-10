@@ -9,3 +9,5 @@ allowBuilds:
   unrs-resolver: true
 patchedDependencies:
   electron-installer-redhat@3.4.0: patches/electron-installer-redhat@3.4.0.patch
+blockExoticSubdeps: false
+nodeLinker: hoisted
