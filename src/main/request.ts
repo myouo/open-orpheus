@@ -18,7 +18,6 @@ const client = got.extend({
       await setCookie(url, parseSetCookie(rawCookie));
     },
   },
-  http2: true,
 });
 
 export default client;
