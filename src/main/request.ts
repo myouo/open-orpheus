@@ -50,7 +50,8 @@ export async function getProxyAgent(
     }
     case "http": {
       const HttpProxyAgent = (await import("http-proxy-agent")).HttpProxyAgent;
-      const HttpsProxyAgent = (await import("https-proxy-agent")).HttpsProxyAgent;
+      const HttpsProxyAgent = (await import("https-proxy-agent"))
+        .HttpsProxyAgent;
       const cfg = config[config.Type]!;
       const httpAgent = new HttpProxyAgent(
         getProxyURL(config.Type, cfg),
