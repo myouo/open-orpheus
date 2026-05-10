@@ -36,6 +36,7 @@ import {
 import { stringifyError } from "./util";
 
 import type WebPack from "./main/packs/WebPack";
+import type { ProxyConfiguration } from "./main/request";
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (started) {
@@ -227,7 +228,48 @@ app.on("ready", async () => {
       // Initialize util module
       import("./main/util").then((m) => m.default()),
       import("./main/channel"),
-      import("./main/request").then((m) => m.setupRequestInterceptors()),
+      import("./main/request").then(async (m) => {
+        m.setupRequestInterceptors();
+
+        const { kvGet } = await import("./main/kv");
+        const proxy = kvGet("proxy");
+        if (typeof proxy !== "string" || !proxy) return;
+
+        try {
+          const cfg: ProxyConfiguration = JSON.parse(proxy);
+
+          switch (cfg.Type) {
+            case "ie":
+              app.setProxy({ mode: "system" });
+              break;
+            case "http":
+            case "socks4":
+            case "socks5": {
+              const srv = cfg[cfg.Type]!;
+              app.setProxy({
+                mode: "fixed_servers",
+                proxyRules: `${cfg.Type}://${srv.Host}:${srv.Password}`,
+              });
+              if (srv.UserName || srv.Password) {
+                app.on("login", (event, wc, request, authInfo, callback) => {
+                  if (!authInfo.isProxy) return;
+                  event.preventDefault();
+                  callback(srv.UserName, srv.Password);
+                });
+              }
+              break;
+            }
+            default:
+              app.setProxy({ mode: "direct" });
+              break;
+          }
+
+          const agents = await m.getProxyAgent(cfg);
+          m.setProxy(agents);
+        } catch (err) {
+          console.warn("Failed to get proxy configuration", err);
+        }
+      }),
       // Make sure we handle KV storage IPC calls
       import("./main/kv"),
       prepareDeviceId(),

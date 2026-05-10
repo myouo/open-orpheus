@@ -14,6 +14,9 @@ import { loadFromOrpheusUrl } from "../orpheus";
 import { pngFromIco } from "../util";
 import packManager from "../pack";
 import { stat } from "node:fs/promises";
+import { kvGet, kvSet } from "../kv";
+import type { ProxyConfiguration, ProxyTypes } from "../request";
+import client, { getProxyAgent } from "../request";
 
 registerCallHandler<string[], void>("app.log", (_ev, ...args) => {
   console.log(...args);
@@ -64,8 +67,11 @@ registerCallHandler<[string, string], [string]>(
   (event, item, subItem) => {
     // TODO: Implement this properly
     switch (item) {
-      case "Proxy":
-        return [""]; // No Proxy
+      case "Proxy": {
+        const proxyConf = kvGet("proxy");
+        if (typeof proxyConf !== "string") return [""];
+        return [proxyConf];
+      }
       case "setting":
         break;
       case "features":
@@ -75,6 +81,17 @@ registerCallHandler<[string, string], [string]>(
         break;
     }
     return [""];
+  }
+);
+
+registerCallHandler<[string, string, string], void>(
+  "app.setLocalConfig",
+  (event, item, subItem, value) => {
+    switch (item) {
+      case "Proxy":
+        kvSet("proxy", value);
+        return;
+    }
   }
 );
 
@@ -359,3 +376,38 @@ registerCallbackHandler<
       callback({ action: "no", userdata: params.userdata });
     });
 });
+
+registerCallHandler<[number, ProxyTypes, string, string, string, string], void>(
+  "app.testProxy",
+  (event, taskId, type, address, username, password, url) => {
+    (async () => {
+      const cfg: ProxyConfiguration = {
+        Type: type,
+      };
+      const addr = address.split(":");
+      const host = addr[0];
+      const port = addr[1];
+      cfg[type] = {
+        Host: host,
+        Port: port,
+        UserName: username,
+        Password: password,
+      };
+      const agent = await getProxyAgent(cfg);
+      try {
+        const req = await client(url, {
+          agent,
+          throwHttpErrors: false,
+        });
+        event.sender.send(
+          "channel.call",
+          "app.ontestproxy",
+          taskId,
+          req.ok ? 0 : 7
+        );
+      } catch {
+        event.sender.send("channel.call", "app.ontestproxy", taskId, 7);
+      }
+    })();
+  }
+);
