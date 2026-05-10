@@ -253,7 +253,7 @@ jobs:
         run: |
           gh release edit "v${{ inputs.version }}" \
             --draft=false \
-            ${{ inputs.pre_release && '--prerelease' || '' }}
+            ${{ inputs.pre_release && '--prerelease' || '' }} \
             ${{ inputs.discussion_category && format('--discussion-category "{0}"', inputs.discussion_category) || '' }}
 
       - name: Trigger Flathub publish workflow
