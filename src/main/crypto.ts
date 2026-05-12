@@ -42,6 +42,13 @@ export function encodeAnonymousId(anonymousId: string): string {
   return digest.toString("base64");
 }
 
+export function encodeAnonymousUsername(anonymousId: string): string {
+  return Buffer.from(
+    `${anonymousId} ${encodeAnonymousId(anonymousId)}`,
+    "utf8"
+  ).toString("base64");
+}
+
 /**
  * Encrypts plaintext using AES-128-ECB + double Base64.
  *

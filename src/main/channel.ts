@@ -3,7 +3,7 @@ import { dispatcher } from "./calls";
 import {
   deData,
   deserialData,
-  encodeAnonymousId,
+  encodeAnonymousUsername,
   enData,
   SERIAL_AES_KEY,
   serialData,
@@ -57,9 +57,7 @@ ipcMain.on("channel.deserialData", (event, hexParams: string | ArrayBuffer) => {
 });
 
 ipcMain.on("channel.encodeAnonymousId", (event, id: string) => {
-  event.returnValue = Buffer.from(id + " " + encodeAnonymousId(id)).toString(
-    "base64"
-  );
+  event.returnValue = encodeAnonymousUsername(id);
 });
 
 ipcMain.on("channel.serialKey", (event, key: string) => {

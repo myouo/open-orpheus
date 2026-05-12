@@ -31,64 +31,119 @@ export type NetworkFetchResponse = {
   blob: string;
 }>;
 
+async function fetchRequest(request: NetworkFetchRequest, retryCount: number) {
+  return await client(request.url, {
+    method: request.method,
+    headers: {
+      ...request.headers,
+    },
+    body: request.body || undefined,
+    throwHttpErrors: false,
+    retry: {
+      limit: retryCount,
+      backoffLimit: 10000,
+    },
+    hooks: {
+      beforeRetry: [
+        () => {
+          globalFailCount++;
+        },
+      ],
+    },
+  });
+}
+
+async function responseToNetworkFetchResponse(
+  request: NetworkFetchRequest,
+  response: Awaited<ReturnType<typeof fetchRequest>>,
+  retryCount: number
+): Promise<NetworkFetchResponse> {
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(response.headers)) {
+    if (Array.isArray(value)) {
+      headers[key] = value.join(", ");
+    } else if (value !== undefined) {
+      headers[key] = value;
+    }
+  }
+
+  const responseBody = Buffer.from(response.rawBody);
+  const blob = request.isDecrypt
+    ? deserialData(
+        responseBody.buffer.slice(
+          responseBody.byteOffset,
+          responseBody.byteOffset + responseBody.byteLength
+        )
+      )
+    : responseBody.toString();
+
+  globalSucCount++;
+
+  return {
+    code: 0,
+    blob,
+    error: "",
+    globalFailCount,
+    globalSucCount,
+    headers,
+    retryTimes: retryCount - response.retryCount - 1,
+    status: response.statusCode,
+  };
+}
+
+async function shouldRetryAfterAnonymousRegistration(
+  request: NetworkFetchRequest,
+  response: Awaited<ReturnType<typeof fetchRequest>>
+) {
+  const { isMusicApiUrl } = await import("../anonymous");
+  if (!isMusicApiUrl(request.url)) return false;
+  if (response.statusCode === 400) return true;
+
+  try {
+    const responseBody = Buffer.from(response.rawBody);
+    const blob = request.isDecrypt
+      ? deserialData(
+          responseBody.buffer.slice(
+            responseBody.byteOffset,
+            responseBody.byteOffset + responseBody.byteLength
+          )
+        )
+      : responseBody.toString();
+    return JSON.parse(blob).code === 400;
+  } catch {
+    return false;
+  }
+}
+
+function describeRequestUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return "music API request";
+  }
+}
+
 registerCallHandler<[NetworkFetchRequest], [NetworkFetchResponse]>(
   "network.fetch",
   async (_, request): Promise<[NetworkFetchResponse]> => {
     const retryCount = request.retryCount ?? 1;
 
     try {
-      const response = await client(request.url, {
-        method: request.method,
-        headers: {
-          ...request.headers,
-        },
-        body: request.body || undefined,
-        throwHttpErrors: false,
-        retry: {
-          limit: retryCount,
-          backoffLimit: 10000,
-        },
-        hooks: {
-          beforeRetry: [
-            () => {
-              globalFailCount++;
-            },
-          ],
-        },
-      });
-
-      const headers: Record<string, string> = {};
-      for (const [key, value] of Object.entries(response.headers)) {
-        if (Array.isArray(value)) {
-          headers[key] = value.join(", ");
-        } else if (value !== undefined) {
-          headers[key] = value;
+      let response = await fetchRequest(request, retryCount);
+      if (await shouldRetryAfterAnonymousRegistration(request, response)) {
+        const { ensureAnonymousSession } = await import("../anonymous");
+        const registered = await ensureAnonymousSession({
+          force: true,
+          reason: `400 from ${describeRequestUrl(request.url)}`,
+        });
+        if (registered) {
+          response = await fetchRequest(request, retryCount);
         }
       }
 
-      const responseBody = Buffer.from(response.rawBody);
-      const blob = request.isDecrypt
-        ? deserialData(
-            responseBody.buffer.slice(
-              responseBody.byteOffset,
-              responseBody.byteOffset + responseBody.byteLength
-            )
-          )
-        : responseBody.toString();
-
-      globalSucCount++;
-
       return [
-        {
-          code: 0,
-          blob,
-          error: "",
-          globalFailCount,
-          globalSucCount,
-          headers,
-          retryTimes: retryCount - response.retryCount - 1,
-          status: response.statusCode,
-        },
+        await responseToNetworkFetchResponse(request, response, retryCount),
       ];
     } catch (error) {
       globalFailCount++;
