@@ -171,8 +171,8 @@ app.on("ready", async () => {
     await mkdir(path.join(dataDir), { recursive: true });
 
     let userAgent = session.defaultSession.getUserAgent();
-    if (os.platform() === "linux") {
-      // Make some modules think we are indeed on desktop.
+    if (os.platform() !== "win32") {
+      // Keep the Windows web package, device constants, and request UA in the same platform family.
       userAgent = userAgent.replace(
         /^(Mozilla\/5\.0 \([^)]*\))/,
         "Mozilla/5.0 (Windows NT 10.0; WOW64)"
@@ -283,6 +283,10 @@ app.on("ready", async () => {
         m.default();
       }),
     ]);
+
+    await import("./main/anonymous").then((m) =>
+      m.bootstrapMusicRequestCookies()
+    );
 
     onExit(() => {
       app.quit(); // Graceful exit

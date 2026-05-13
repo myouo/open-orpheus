@@ -95,8 +95,10 @@ async function shouldRetryAfterAnonymousRegistration(
   request: NetworkFetchRequest,
   response: Awaited<ReturnType<typeof fetchRequest>>
 ) {
-  const { isMusicApiUrl } = await import("../anonymous");
+  const { isAnonymousRegistrationUrl, isMusicApiUrl } =
+    await import("../anonymous");
   if (!isMusicApiUrl(request.url)) return false;
+  if (isAnonymousRegistrationUrl(request.url)) return false;
   if (response.statusCode === 400) return true;
 
   try {
