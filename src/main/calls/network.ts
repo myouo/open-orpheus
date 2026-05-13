@@ -111,7 +111,8 @@ async function shouldRetryAfterAnonymousRegistration(
           )
         )
       : responseBody.toString();
-    return JSON.parse(blob).code === 400;
+    const code = JSON.parse(blob).code;
+    return code === 400 || code === 301;
   } catch {
     return false;
   }
@@ -137,7 +138,7 @@ registerCallHandler<[NetworkFetchRequest], [NetworkFetchResponse]>(
         const { ensureAnonymousSession } = await import("../anonymous");
         const registered = await ensureAnonymousSession({
           force: true,
-          reason: `400 from ${describeRequestUrl(request.url)}`,
+          reason: `auth error from ${describeRequestUrl(request.url)}`,
         });
         if (registered) {
           response = await fetchRequest(request, retryCount);

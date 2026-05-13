@@ -284,9 +284,10 @@ app.on("ready", async () => {
       }),
     ]);
 
-    await import("./main/anonymous").then((m) =>
-      m.bootstrapMusicRequestCookies()
-    );
+    await import("./main/anonymous").then(async (m) => {
+      await m.bootstrapMusicRequestCookies();
+      await m.ensureAnonymousSession({ reason: "startup" });
+    });
 
     onExit(() => {
       app.quit(); // Graceful exit

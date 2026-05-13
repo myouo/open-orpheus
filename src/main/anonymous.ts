@@ -1,15 +1,35 @@
-import { randomInt } from "node:crypto";
+import { createHash, randomInt } from "node:crypto";
+import { readFile, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { SetCookie } from "cookie";
 
-import { OSVER, VERSION } from "../constants";
-import { encodeAnonymousUsername } from "./crypto";
-import { getADDeviceId, getDeviceId } from "./device";
+import { CORE_VERSION, OSVER } from "../constants";
+import { deserialData, encodeAnonymousUsername, serialData } from "./crypto";
+import {
+  forgetSuccessfulDeviceId,
+  getADDeviceId,
+  getDeviceId,
+  refreshDeviceId,
+  rememberSuccessfulDeviceId,
+  useDeviceId,
+} from "./device";
 import { getCookies, getFullCookies, removeCookie, setCookie } from "./cookie";
+import { data as dataDir } from "./folders";
 import client from "./request";
 
 const MUSIC_ORIGIN = "https://music.163.com";
+const INTERFACE_PC_ORIGIN = "https://interfacepc.music.163.com";
 // The upstream endpoint keeps the historical "anonimous" spelling.
-const ANONYMOUS_API_URL = `${MUSIC_ORIGIN}/api/register/anonimous`;
+const ANONYMOUS_API_PATH = "/api/register/anonimous";
+const ANONYMOUS_EAPI_URL = `${INTERFACE_PC_ORIGIN}/eapi/register/anonimous`;
+const MAX_ANONYMOUS_REGISTRATION_ATTEMPTS = 10;
+const ANONYMOUS_SESSION_VERSION = 2;
+const anonymousSessionFilePath = join(dataDir, "anonymous_session.json");
+const ANONYMOUS_AUTH_COOKIE_NAME = "MUSIC_A";
+const ANONYMOUS_SESSION_COOKIE_NAMES = new Set([
+  ANONYMOUS_AUTH_COOKIE_NAME,
+  "__csrf",
+]);
 
 type AnonymousSessionOptions = {
   force?: boolean;
@@ -17,11 +37,138 @@ type AnonymousSessionOptions = {
 };
 
 type StoredCookie = Awaited<ReturnType<typeof getFullCookies>>[number];
+type PersistedAnonymousCookie = Pick<
+  StoredCookie,
+  | "name"
+  | "value"
+  | "domain"
+  | "path"
+  | "httpOnly"
+  | "secure"
+  | "expirationDate"
+  | "sameSite"
+>;
+type PersistedAnonymousSession = {
+  version?: number;
+  deviceId?: string;
+  cookies?: PersistedAnonymousCookie[];
+};
+type AnonymousRegistrationResponse = Awaited<
+  ReturnType<typeof postAnonymousRegistration>
+>;
+
+type AnonymousAttemptSnapshot = {
+  reason: string | null;
+  attempt: number;
+  maxAttempts: number;
+  deviceId: string;
+  clientSign: {
+    hash: string;
+    mac: string;
+    diskSerialHexLength: number;
+    diskSerialAscii: string;
+    part3Length: number;
+    part3Preview: string;
+    part4Length: number;
+    part4Prefix: string;
+  };
+};
 
 let pendingAnonymousSession: Promise<boolean> | null = null;
 
 function createRequestId() {
   return `${Date.now()}_${randomInt(1000).toString().padStart(4, "0")}`;
+}
+
+function isExpiredCookie(cookie: Pick<StoredCookie, "expirationDate">) {
+  return Boolean(
+    cookie.expirationDate && cookie.expirationDate <= Date.now() / 1000 + 60
+  );
+}
+
+function isAnonymousSessionCookie(
+  cookie: Pick<StoredCookie, "name" | "value" | "expirationDate">
+) {
+  return Boolean(
+    ANONYMOUS_SESSION_COOKIE_NAMES.has(cookie.name) &&
+    cookie.value &&
+    !isExpiredCookie(cookie)
+  );
+}
+
+function hasAnonymousAuthCookie(
+  cookies: ReadonlyArray<Pick<StoredCookie, "name">>
+) {
+  return cookies.some((cookie) => cookie.name === ANONYMOUS_AUTH_COOKIE_NAME);
+}
+
+function previewValue(value: string, length = 16) {
+  if (!value) return "";
+  return value.length <= length ? value : value.slice(0, length);
+}
+
+function decodeHexAscii(value: string) {
+  if (!value || value.length % 2 !== 0 || !/^[\dA-F]+$/i.test(value)) {
+    return "";
+  }
+
+  try {
+    const decoded = Buffer.from(value, "hex").toString("ascii").trim();
+    return /^[\x20-\x7E]+$/.test(decoded) ? decoded : "";
+  } catch {
+    return "";
+  }
+}
+
+function summarizeClientSign(clientSign: string) {
+  const [mac = "", diskSerialHex = "", part3 = "", part4 = ""] =
+    clientSign.split("@@@");
+
+  return {
+    hash: createHash("sha1").update(clientSign).digest("hex").slice(0, 12),
+    mac,
+    diskSerialHexLength: diskSerialHex.length,
+    diskSerialAscii: decodeHexAscii(diskSerialHex),
+    part3Length: part3.length,
+    part3Preview: previewValue(part3),
+    part4Length: part4.length,
+    part4Prefix: previewValue(part4),
+  };
+}
+
+function createAttemptSnapshot(
+  reason: string | undefined,
+  attempt: number,
+  deviceId: string
+): AnonymousAttemptSnapshot {
+  return {
+    reason: reason ?? null,
+    attempt,
+    maxAttempts: MAX_ANONYMOUS_REGISTRATION_ATTEMPTS,
+    deviceId,
+    clientSign: summarizeClientSign(getADDeviceId()),
+  };
+}
+
+function logAttemptSnapshot(snapshot: AnonymousAttemptSnapshot) {
+  console.info("[anonymous] Registration attempt snapshot", snapshot);
+}
+
+function logResponseSnapshot(
+  snapshot: AnonymousAttemptSnapshot,
+  response: AnonymousRegistrationResponse,
+  responseCode: number | undefined,
+  extra: {
+    hasAnonymousCookie?: boolean;
+  } = {}
+) {
+  console.info("[anonymous] Registration response snapshot", {
+    ...snapshot,
+    httpStatus: response.statusCode,
+    responseCode: responseCode ?? null,
+    responseBodyLength: response.rawBody.length,
+    ...extra,
+  });
 }
 
 async function setBootstrapCookie(name: string, value: string) {
@@ -40,17 +187,24 @@ async function setBootstrapCookies() {
 
   await Promise.all([
     setBootstrapCookie("os", "pc"),
-    setBootstrapCookie("appver", VERSION),
+    setBootstrapCookie("appver", CORE_VERSION),
     setBootstrapCookie("channel", "netease"),
     setBootstrapCookie("deviceId", deviceId),
     setBootstrapCookie("clientSign", clientSign),
     setBootstrapCookie("osver", OSVER),
+    setBootstrapCookie("mode", "System Product Name"),
   ]);
 }
 
 export async function bootstrapMusicRequestCookies() {
   const authState = await getMusicAuthState();
   if (authState.hasUser) return;
+
+  if (!authState.hasAnonymous) {
+    await restorePersistedAnonymousSession();
+  } else {
+    await persistAnonymousSessionCookies();
+  }
 
   await setBootstrapCookies();
 }
@@ -59,26 +213,34 @@ export async function getMusicAuthState() {
   const cookies = await getCookies(MUSIC_ORIGIN);
   return {
     hasUser: Boolean(cookies.MUSIC_U),
-    hasAnonymous: Boolean(cookies.MUSIC_A),
+    hasAnonymous: Boolean(cookies[ANONYMOUS_AUTH_COOKIE_NAME]),
   };
 }
 
-function parseRegisterResponseCode(responseBody: Buffer<ArrayBufferLike>) {
+function parseRegisterResponseBody(responseBody: Buffer<ArrayBufferLike>) {
   try {
-    const body = JSON.parse(responseBody.toString());
-    return body?.code;
+    return JSON.parse(responseBody.toString());
   } catch {
-    return undefined;
+    try {
+      return JSON.parse(deserialData(responseBody.toString()));
+    } catch {
+      return undefined;
+    }
   }
 }
 
-function isSuccessfulRegisterResponse(responseBody: Buffer<ArrayBufferLike>) {
-  return parseRegisterResponseCode(responseBody) === 200;
+function parseRegisterResponseCode(responseBody: Buffer<ArrayBufferLike>) {
+  return parseRegisterResponseBody(responseBody)?.code;
 }
 
 async function getAnonymousCookie() {
   const cookies = await getFullCookies(MUSIC_ORIGIN);
-  return cookies.find((cookie) => cookie.name === "MUSIC_A");
+  return cookies.find((cookie) => cookie.name === ANONYMOUS_AUTH_COOKIE_NAME);
+}
+
+async function getAnonymousSessionCookies() {
+  const cookies = await getFullCookies(MUSIC_ORIGIN);
+  return cookies.filter(isAnonymousSessionCookie);
 }
 
 function toSetCookieSameSite(
@@ -96,22 +258,28 @@ function toSetCookieSameSite(
   }
 }
 
-async function restoreAnonymousCookie(cookie: StoredCookie | undefined) {
+async function setStoredCookie(
+  cookie: PersistedAnonymousCookie | StoredCookie | undefined
+) {
   if (!cookie) return;
 
+  await setCookie(MUSIC_ORIGIN, {
+    name: cookie.name,
+    value: cookie.value,
+    domain: cookie.domain,
+    path: cookie.path,
+    httpOnly: cookie.httpOnly,
+    secure: cookie.secure,
+    expires: cookie.expirationDate
+      ? new Date(cookie.expirationDate * 1000)
+      : undefined,
+    sameSite: toSetCookieSameSite(cookie.sameSite),
+  });
+}
+
+async function restoreAnonymousCookie(cookie: StoredCookie | undefined) {
   try {
-    await setCookie(MUSIC_ORIGIN, {
-      name: cookie.name,
-      value: cookie.value,
-      domain: cookie.domain,
-      path: cookie.path,
-      httpOnly: cookie.httpOnly,
-      secure: cookie.secure,
-      expires: cookie.expirationDate
-        ? new Date(cookie.expirationDate * 1000)
-        : undefined,
-      sameSite: toSetCookieSameSite(cookie.sameSite),
-    });
+    await setStoredCookie(cookie);
   } catch (error) {
     console.warn(
       `[anonymous] Failed to restore previous anonymous session: ${(error as Error)?.message || String(error)}`
@@ -119,10 +287,121 @@ async function restoreAnonymousCookie(cookie: StoredCookie | undefined) {
   }
 }
 
-async function registerAnonymousSession(options: AnonymousSessionOptions) {
+async function persistAnonymousSessionCookies() {
+  const cookies = await getAnonymousSessionCookies();
+  if (!hasAnonymousAuthCookie(cookies)) return;
+
+  const persisted: PersistedAnonymousSession = {
+    version: ANONYMOUS_SESSION_VERSION,
+    deviceId: getDeviceId(),
+    cookies: cookies.map((cookie) => ({
+      name: cookie.name,
+      value: cookie.value,
+      domain: cookie.domain,
+      path: cookie.path,
+      httpOnly: cookie.httpOnly,
+      secure: cookie.secure,
+      expirationDate: cookie.expirationDate,
+      sameSite: cookie.sameSite,
+    })),
+  };
+
+  try {
+    await writeFile(
+      anonymousSessionFilePath,
+      JSON.stringify(persisted, null, 2),
+      "utf-8"
+    );
+  } catch (error) {
+    console.warn(
+      `[anonymous] Failed to persist anonymous session: ${(error as Error)?.message || String(error)}`
+    );
+  }
+}
+
+async function forgetPersistedAnonymousSession() {
+  try {
+    await unlink(anonymousSessionFilePath);
+  } catch {
+    // It is fine if there is no persisted anonymous session yet.
+  }
+}
+
+async function restorePersistedAnonymousSession() {
+  let persisted: PersistedAnonymousSession;
+  try {
+    persisted = JSON.parse(await readFile(anonymousSessionFilePath, "utf-8"));
+  } catch {
+    return false;
+  }
+
+  if (persisted.version !== ANONYMOUS_SESSION_VERSION) return false;
+
+  const cookies = (persisted.cookies ?? []).filter(isAnonymousSessionCookie);
+  if (!hasAnonymousAuthCookie(cookies)) {
+    await forgetPersistedAnonymousSession();
+    return false;
+  }
+  if (!persisted.deviceId || !(await useDeviceId(persisted.deviceId))) {
+    await forgetPersistedAnonymousSession();
+    return false;
+  }
+
+  try {
+    await Promise.all(cookies.map(setStoredCookie));
+  } catch (error) {
+    console.warn(
+      `[anonymous] Failed to restore persisted anonymous session: ${(error as Error)?.message || String(error)}`
+    );
+    return false;
+  }
+
   const authState = await getMusicAuthState();
+  if (authState.hasAnonymous) {
+    await rememberSuccessfulDeviceId(persisted.deviceId);
+    console.info("[anonymous] Restored persisted anonymous session");
+    return true;
+  }
+
+  await forgetPersistedAnonymousSession();
+  return false;
+}
+
+async function postAnonymousRegistration(deviceId: string) {
+  return await client.post(ANONYMOUS_EAPI_URL, {
+    headers: {
+      Accept: "*/*",
+      "Content-Type": "application/x-www-form-urlencoded",
+      Referer: `${MUSIC_ORIGIN}/`,
+      "X-Request-ID": createRequestId(),
+    },
+    body: new URLSearchParams({
+      params: serialData(ANONYMOUS_API_PATH, {
+        username: encodeAnonymousUsername(deviceId),
+      }),
+    }).toString(),
+    retry: {
+      limit: 0,
+    },
+    throwHttpErrors: false,
+    timeout: {
+      request: 5000,
+    },
+  });
+}
+
+async function registerAnonymousSession(options: AnonymousSessionOptions) {
+  let authState = await getMusicAuthState();
+  if (!authState.hasUser && !authState.hasAnonymous) {
+    await restorePersistedAnonymousSession();
+    authState = await getMusicAuthState();
+  }
+
   if (authState.hasUser) return true;
-  if (authState.hasAnonymous && !options.force) return true;
+  if (authState.hasAnonymous && !options.force) {
+    await persistAnonymousSessionCookies();
+    return true;
+  }
 
   const deviceId = getDeviceId();
   if (!deviceId) {
@@ -136,60 +415,89 @@ async function registerAnonymousSession(options: AnonymousSessionOptions) {
       : undefined;
 
   if (options.force && authState.hasAnonymous) {
-    await removeCookie(MUSIC_ORIGIN, "MUSIC_A");
+    await removeCookie(MUSIC_ORIGIN, ANONYMOUS_AUTH_COOKIE_NAME);
+    await forgetPersistedAnonymousSession();
   }
 
   await setBootstrapCookies();
 
-  const response = await (async () => {
+  let response: AnonymousRegistrationResponse;
+
+  for (
+    let attempt = 1;
+    attempt <= MAX_ANONYMOUS_REGISTRATION_ATTEMPTS;
+    attempt++
+  ) {
+    const currentDeviceId = getDeviceId();
+    if (!currentDeviceId) {
+      console.warn(
+        "[anonymous] Cannot register anonymous session: no device ID"
+      );
+      return false;
+    }
+
+    const attemptSnapshot = createAttemptSnapshot(
+      options.reason,
+      attempt,
+      currentDeviceId
+    );
+    logAttemptSnapshot(attemptSnapshot);
+
     try {
-      return await client.post(ANONYMOUS_API_URL, {
-        headers: {
-          Accept: "*/*",
-          "Content-Type": "application/x-www-form-urlencoded",
-          Referer: `${MUSIC_ORIGIN}/`,
-          "X-Request-ID": createRequestId(),
-        },
-        body: new URLSearchParams({
-          username: encodeAnonymousUsername(deviceId),
-        }).toString(),
-        retry: {
-          limit: 0,
-        },
-        throwHttpErrors: false,
-        timeout: {
-          request: 8000,
-        },
-      });
+      response = await postAnonymousRegistration(currentDeviceId);
     } catch (error) {
       await restoreAnonymousCookie(previousAnonymousCookie);
       throw error;
     }
-  })();
 
-  const responseBody = Buffer.from(response.rawBody);
-  if (!isSuccessfulRegisterResponse(responseBody)) {
+    const responseBody = Buffer.from(response.rawBody);
+    const responseCode = parseRegisterResponseCode(responseBody);
+    if (responseCode === 200) {
+      const nextAuthState = await getMusicAuthState();
+      logResponseSnapshot(attemptSnapshot, response, responseCode, {
+        hasAnonymousCookie: nextAuthState.hasAnonymous,
+      });
+      if (nextAuthState.hasAnonymous) {
+        await rememberSuccessfulDeviceId(currentDeviceId);
+        await persistAnonymousSessionCookies();
+        if (options.reason) {
+          console.info(
+            `[anonymous] Registered anonymous session: ${options.reason} (attempt ${attempt}/${MAX_ANONYMOUS_REGISTRATION_ATTEMPTS})`
+          );
+        }
+        return true;
+      }
+
+      await restoreAnonymousCookie(previousAnonymousCookie);
+      console.warn(
+        `[anonymous] Anonymous session registration failed: HTTP ${response.statusCode}, missing MUSIC_A`
+      );
+      return false;
+    }
+
+    logResponseSnapshot(attemptSnapshot, response, responseCode);
+
+    if (responseCode === 400 && attempt < MAX_ANONYMOUS_REGISTRATION_ATTEMPTS) {
+      console.warn(
+        `[anonymous] Anonymous session registration got code 400, retrying with a new device identity (${attempt}/${MAX_ANONYMOUS_REGISTRATION_ATTEMPTS})`
+      );
+      await forgetSuccessfulDeviceId(currentDeviceId);
+      await refreshDeviceId("anonymous registration returned code 400", {
+        rotateDeviceId: true,
+      });
+      await setBootstrapCookies();
+      continue;
+    }
+
     await restoreAnonymousCookie(previousAnonymousCookie);
     console.warn(
-      `[anonymous] Anonymous session registration failed: HTTP ${response.statusCode}, code ${String(parseRegisterResponseCode(responseBody) ?? "unknown")}`
+      `[anonymous] Anonymous session registration failed: HTTP ${response.statusCode}, code ${String(responseCode ?? "unknown")}`
     );
     return false;
   }
 
-  const nextAuthState = await getMusicAuthState();
-  if (nextAuthState.hasAnonymous) {
-    if (options.reason) {
-      console.info(
-        `[anonymous] Registered anonymous session: ${options.reason}`
-      );
-    }
-    return true;
-  }
-
   await restoreAnonymousCookie(previousAnonymousCookie);
-  console.warn(
-    `[anonymous] Anonymous session registration failed: HTTP ${response.statusCode}`
-  );
+  console.warn("[anonymous] Anonymous session registration attempts exhausted");
   return false;
 }
 
