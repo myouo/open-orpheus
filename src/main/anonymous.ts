@@ -1,4 +1,4 @@
-import { createHash, randomInt } from "node:crypto";
+import { randomInt } from "node:crypto";
 import { readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { SetCookie } from "cookie";
@@ -24,8 +24,8 @@ const ANONYMOUS_API_PATH = "/api/register/anonimous";
 const ANONYMOUS_EAPI_URL = `${INTERFACE_PC_ORIGIN}/eapi/register/anonimous`;
 const MAX_ANONYMOUS_REGISTRATION_ATTEMPTS = 10;
 const ANONYMOUS_SESSION_VERSION = 2;
-const anonymousSessionFilePath = join(dataDir, "anonymous_session.json");
 const ANONYMOUS_AUTH_COOKIE_NAME = "MUSIC_A";
+const anonymousSessionFilePath = join(dataDir, "anonymous_session.json");
 const ANONYMOUS_SESSION_COOKIE_NAMES = new Set([
   ANONYMOUS_AUTH_COOKIE_NAME,
   "__csrf",
@@ -57,23 +57,6 @@ type AnonymousRegistrationResponse = Awaited<
   ReturnType<typeof postAnonymousRegistration>
 >;
 
-type AnonymousAttemptSnapshot = {
-  reason: string | null;
-  attempt: number;
-  maxAttempts: number;
-  deviceId: string;
-  clientSign: {
-    hash: string;
-    mac: string;
-    diskSerialHexLength: number;
-    diskSerialAscii: string;
-    part3Length: number;
-    part3Preview: string;
-    part4Length: number;
-    part4Prefix: string;
-  };
-};
-
 let pendingAnonymousSession: Promise<boolean> | null = null;
 
 function createRequestId() {
@@ -100,75 +83,6 @@ function hasAnonymousAuthCookie(
   cookies: ReadonlyArray<Pick<StoredCookie, "name">>
 ) {
   return cookies.some((cookie) => cookie.name === ANONYMOUS_AUTH_COOKIE_NAME);
-}
-
-function previewValue(value: string, length = 16) {
-  if (!value) return "";
-  return value.length <= length ? value : value.slice(0, length);
-}
-
-function decodeHexAscii(value: string) {
-  if (!value || value.length % 2 !== 0 || !/^[\dA-F]+$/i.test(value)) {
-    return "";
-  }
-
-  try {
-    const decoded = Buffer.from(value, "hex").toString("ascii").trim();
-    return /^[\x20-\x7E]+$/.test(decoded) ? decoded : "";
-  } catch {
-    return "";
-  }
-}
-
-function summarizeClientSign(clientSign: string) {
-  const [mac = "", diskSerialHex = "", part3 = "", part4 = ""] =
-    clientSign.split("@@@");
-
-  return {
-    hash: createHash("sha1").update(clientSign).digest("hex").slice(0, 12),
-    mac,
-    diskSerialHexLength: diskSerialHex.length,
-    diskSerialAscii: decodeHexAscii(diskSerialHex),
-    part3Length: part3.length,
-    part3Preview: previewValue(part3),
-    part4Length: part4.length,
-    part4Prefix: previewValue(part4),
-  };
-}
-
-function createAttemptSnapshot(
-  reason: string | undefined,
-  attempt: number,
-  deviceId: string
-): AnonymousAttemptSnapshot {
-  return {
-    reason: reason ?? null,
-    attempt,
-    maxAttempts: MAX_ANONYMOUS_REGISTRATION_ATTEMPTS,
-    deviceId,
-    clientSign: summarizeClientSign(getADDeviceId()),
-  };
-}
-
-function logAttemptSnapshot(snapshot: AnonymousAttemptSnapshot) {
-  console.info("[anonymous] Registration attempt snapshot", snapshot);
-}
-
-function logResponseSnapshot(
-  snapshot: AnonymousAttemptSnapshot,
-  response: AnonymousRegistrationResponse,
-  responseCode: number | undefined,
-  extra: {
-    hasAnonymousCookie?: boolean;
-  } = {}
-) {
-  console.info("[anonymous] Registration response snapshot", {
-    ...snapshot,
-    httpStatus: response.statusCode,
-    responseCode: responseCode ?? null,
-    responseBodyLength: response.rawBody.length,
-    ...extra,
-  });
 }
 
 async function setBootstrapCookie(name: string, value: string) {
@@ -390,6 +304,19 @@ async function postAnonymousRegistration(deviceId: string) {
   });
 }
 
+function logRegistrationResponse(
+  response: AnonymousRegistrationResponse,
+  responseCode: number | undefined,
+  attempt: number
+) {
+  console.info("[anonymous] Registration response", {
+    attempt,
+    httpStatus: response.statusCode,
+    responseCode: responseCode ?? null,
+    responseBodyLength: response.rawBody.length,
+  });
+}
+
 async function registerAnonymousSession(options: AnonymousSessionOptions) {
   let authState = await getMusicAuthState();
   if (!authState.hasUser && !authState.hasAnonymous) {
@@ -401,12 +328,6 @@ async function registerAnonymousSession(options: AnonymousSessionOptions) {
   if (authState.hasAnonymous && !options.force) {
     await persistAnonymousSessionCookies();
     return true;
-  }
-
-  const deviceId = getDeviceId();
-  if (!deviceId) {
-    console.warn("[anonymous] Cannot register anonymous session: no device ID");
-    return false;
   }
 
   const previousAnonymousCookie =
@@ -421,8 +342,6 @@ async function registerAnonymousSession(options: AnonymousSessionOptions) {
 
   await setBootstrapCookies();
 
-  let response: AnonymousRegistrationResponse;
-
   for (
     let attempt = 1;
     attempt <= MAX_ANONYMOUS_REGISTRATION_ATTEMPTS;
@@ -436,13 +355,14 @@ async function registerAnonymousSession(options: AnonymousSessionOptions) {
       return false;
     }
 
-    const attemptSnapshot = createAttemptSnapshot(
-      options.reason,
+    console.info("[anonymous] Registration attempt", {
+      reason: options.reason ?? null,
       attempt,
-      currentDeviceId
-    );
-    logAttemptSnapshot(attemptSnapshot);
+      maxAttempts: MAX_ANONYMOUS_REGISTRATION_ATTEMPTS,
+      deviceId: currentDeviceId,
+    });
 
+    let response: AnonymousRegistrationResponse;
     try {
       response = await postAnonymousRegistration(currentDeviceId);
     } catch (error) {
@@ -452,11 +372,10 @@ async function registerAnonymousSession(options: AnonymousSessionOptions) {
 
     const responseBody = Buffer.from(response.rawBody);
     const responseCode = parseRegisterResponseCode(responseBody);
+    logRegistrationResponse(response, responseCode, attempt);
+
     if (responseCode === 200) {
       const nextAuthState = await getMusicAuthState();
-      logResponseSnapshot(attemptSnapshot, response, responseCode, {
-        hasAnonymousCookie: nextAuthState.hasAnonymous,
-      });
       if (nextAuthState.hasAnonymous) {
         await rememberSuccessfulDeviceId(currentDeviceId);
         await persistAnonymousSessionCookies();
@@ -474,8 +393,6 @@ async function registerAnonymousSession(options: AnonymousSessionOptions) {
       );
       return false;
     }
-
-    logResponseSnapshot(attemptSnapshot, response, responseCode);
 
     if (responseCode === 400 && attempt < MAX_ANONYMOUS_REGISTRATION_ATTEMPTS) {
       console.warn(
