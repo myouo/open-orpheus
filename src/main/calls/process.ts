@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 
 import { MusicTagger } from "music-tag-native";
+import type { Progress } from "got";
 
 import { registerCallHandler } from "../calls";
 import { serialData } from "../crypto";
@@ -142,6 +143,8 @@ async function handleUpload(
     const filename = basename(fullPath);
 
     if (checkRes.needUpload) {
+      let upload: Record<string, unknown> = {};
+
       const allocRes = await uploadClient
         .post(`${payload.domain}/api/whale/token/alloc`, {
           headers: {
@@ -178,6 +181,14 @@ async function handleUpload(
         throw new Error("NOS alloc failed");
       }
 
+      upload = {
+        bucket: allocRes.data.bucket,
+        context: "",
+        docId: allocRes.data.resourceId,
+        objectKey: allocRes.data.token,
+        uploadChannel: "Nos",
+      };
+
       event.sender.send(
         "channel.call",
         "subprocess.oncall",
@@ -191,13 +202,7 @@ async function handleUpload(
           response: "",
           schedule: 0.0,
           songId: "",
-          upload: {
-            bucket: allocRes.data.bucket,
-            context: "",
-            docId: allocRes.data.resourceId,
-            objectKey: allocRes.data.token,
-            uploadChannel: "Nos",
-          },
+          upload,
           url: "",
         })
       );
@@ -209,28 +214,66 @@ async function handleUpload(
         upload: string[];
       }>();
 
-      // TODO: Upload progress update
       const uploadUrl = lbsRes.upload[0];
-      const uploadRes = await uploadClient
-        .post(
-          `${uploadUrl}/${allocRes.data.bucket}/${encodeURIComponent(allocRes.data.objectKey)}?offset=0&complete=true&version=1.0`,
-          {
-            headers: {
-              "x-nos-token": allocRes.data.token,
-              "Content-Type": "application/x-www-form-urlencoded",
-            },
-            body: content,
+      const uploadReq = uploadClient.stream.post(
+        `${uploadUrl}/${allocRes.data.bucket}/${encodeURIComponent(allocRes.data.objectKey)}?offset=0&complete=true&version=1.0`,
+        {
+          headers: {
+            "x-nos-token": allocRes.data.token,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: content,
+        }
+      );
+
+      uploadReq.on("uploadProgress", (progress: Progress) => {
+        event.sender.send(
+          "channel.call",
+          "subprocess.oncall",
+          0,
+          "upload.onUpload",
+          JSON.stringify({
+            activeCode: 0,
+            code: 0,
+            end: false,
+            path: payload.path,
+            response: "",
+            schedule: progress.percent,
+            songId: "",
+            upload,
+            url: "",
+          })
+        );
+      });
+
+      const uploadRes = await new Promise<{
+        requestId: string;
+        offset: number;
+        context: string;
+        callbackRetMsg: string;
+      }>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        uploadReq.on("data", (e) => {
+          chunks.push(e);
+        });
+        uploadReq.on("end", () => {
+          const json = Buffer.concat(chunks).toString("utf-8");
+          try {
+            resolve(JSON.parse(json));
+          } catch (e) {
+            reject(e);
           }
-        )
-        .json<{
-          requestId: string;
-          offset: number;
-          context: string;
-          callbackRetMsg: string;
-        }>();
+        });
+        uploadReq.on("error", (err) => {
+          reject(err);
+        });
+      });
+
+      upload.context = uploadRes.context;
+      upload.token = allocRes.data.token;
 
       event.sender.send(
-        "channel.send",
+        "channel.call",
         "subprocess.oncall",
         0,
         "upload.onUpload",
@@ -242,14 +285,7 @@ async function handleUpload(
           response: "",
           schedule: 1.0,
           songId: "",
-          upload: {
-            bucket: allocRes.data.bucket,
-            context: uploadRes.context,
-            docId: allocRes.data.resourceId,
-            objectKey: allocRes.data.objectKey,
-            token: allocRes.data.token,
-            uploadChannel: "Nos",
-          },
+          upload,
           url: "",
         })
       );
@@ -293,14 +329,7 @@ async function handleUpload(
           response: uploadMetaRes.body,
           schedule: 1.0,
           songId: cloudInfo.songId,
-          upload: {
-            bucket: allocRes.data.bucket,
-            context: uploadRes.context,
-            docId: allocRes.data.resourceId,
-            objectKey: allocRes.data.objectKey,
-            token: allocRes.data.token,
-            uploadChannel: "Nos",
-          },
+          upload,
           url: payload.uploadMetaUrl,
         })
       );
